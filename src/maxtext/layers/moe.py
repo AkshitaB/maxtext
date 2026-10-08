@@ -644,9 +644,12 @@ class GateLogit(nnx.Module):
       bias_axes = self.kernel_axes[-len(self.out_features_shape) :]
       bias_shape = kernel_shape[-len(self.out_features_shape) :]
       if self.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2")):
-        # DeepSeek uses MoEBiasVar to naturally isolate from sequence-wise updates
+        # DeepSeek uses MoEBiasVar to naturally isolate from sequence-wise updates. The bias is
+        # held at the gate compute precision: bf16 rounding (ulp 0.125 at |b| ~ 16-32) flips
+        # top-k expert selection against fp32 routers.
+        bias_dtype = jnp.float32 if self.dtype == jnp.float32 else self.weight_dtype
         self.bias = MoEBiasVar(
-            default_bias_init(rngs.params(), bias_shape, self.weight_dtype),
+            default_bias_init(rngs.params(), bias_shape, bias_dtype),
             out_sharding=bias_axes,
         )
       else:
@@ -5097,6 +5100,11 @@ class RoutedAndSharedMoE(nnx.Module):
     )
 
     shared_expert_mlp_dim = maxtext_utils.get_shared_expert_mlp_dim(self.config)
+    # DeepSeek clamps the shared expert's SwiGLU like the routed experts (apply_ffn_activation).
+    clamp_shared = (
+        self.config.decoder_block in (ctypes.DecoderBlockType.DEEPSEEK, ctypes.DecoderBlockType.DEEPSEEK4)
+        and self.config.mlp_activations_limit > 0.0
+    )
     self.shared_experts = linears.MlpBlock(
         mesh=self.mesh,
         in_features=self.moe_expert_input_dim,
@@ -5109,6 +5117,7 @@ class RoutedAndSharedMoE(nnx.Module):
         config=self.config,
         quant=self.quant,
         rngs=self.rngs,
+        activations_limit=self.config.mlp_activations_limit if clamp_shared else None,
     )
 
   @property

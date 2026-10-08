@@ -188,8 +188,9 @@ def convert_model(input_path: str, output_path: str, cache_file_num: int = 2):
           print(f"\nWarning: scale missing for {name}. Keeping original tensor.")
           new_state_dict[name] = tensor
       else:
-        # Keep other non-quantized tensors (like biases, embeds, layer norms) intact in BF16
-        new_state_dict[name] = tensor.to(torch.bfloat16)
+        # Keep non-quantized tensors in their source dtype: bf16 would round the
+        # fp32 router bias and integer tid2eid ids above 256.
+        new_state_dict[name] = tensor
 
     save_file(new_state_dict, os.path.join(output_path, file_name))
 
