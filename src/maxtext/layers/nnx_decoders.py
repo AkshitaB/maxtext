@@ -624,6 +624,7 @@ class NNXDecoder(nnx.Module):
           length=num_full_blocks,
           metadata_axis_name="scanned_blocks",
           rngs=rngs,
+          remat_policy_fn=self.get_remat_policy(),
       )
 
   def _init_scanned_deepseek(self, decoder_block_classes, rngs):
@@ -2380,16 +2381,30 @@ class NNXDecoder(nnx.Module):
     }
 
     # 1. Unrolled prefix layers (0, 1, 2)
+    use_remat = model_mode == "train" and bool(cfg.remat_policy) and cfg.remat_policy != "none"
     for layer_idx in range(num_hash_layers):
       layer = getattr(self, f"layers_{layer_idx}")
-      y, _ = layer(
-          y,
-          decoder_segment_ids,
-          decoder_positions,
-          deterministic,
-          model_mode,
-          **layer_call_kwargs,
-      )
+      if use_remat:
+        y = deepseek4._run_deepseek4_layer_remat(  # pylint: disable=protected-access
+            layer,
+            y,
+            config=cfg,
+            policy=self.get_remat_policy(),
+            decoder_segment_ids=decoder_segment_ids,
+            decoder_positions=decoder_positions,
+            deterministic=deterministic,
+            model_mode=model_mode,
+            **layer_call_kwargs,
+        )
+      else:
+        y, _ = layer(
+            y,
+            decoder_segment_ids,
+            decoder_positions,
+            deterministic,
+            model_mode,
+            **layer_call_kwargs,
+        )
 
     # 2. Scanned blocks
     num_remaining_layers = cfg.num_decoder_layers - num_hash_layers
@@ -2404,6 +2419,7 @@ class NNXDecoder(nnx.Module):
           model_mode,
           length=num_full_blocks,
           metadata_axis_name="scanned_blocks",
+          skip_block_remat=True,
           **layer_call_kwargs,
       )
 
