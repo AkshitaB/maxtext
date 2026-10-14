@@ -125,6 +125,23 @@ def combine_moe_audits(audits):
 MOE_AUDIT_NOT_COMPUTED = -1
 
 
+def reduce_moe_overflow_flags(flags) -> jax.Array:
+  """Reduces replicated scalar or deferred `(..., 1, num_devices)` MoE overflow flags."""
+  if not flags:
+    return jnp.bool_(False)
+  first = jnp.asarray(flags[0], dtype=jnp.bool_)
+  if first.ndim >= 2 and first.shape[-2] == 1:
+    # Deferred per-device flags (`defer_small_all_reduces=True`): each entry has shape `(..., 1, num_devices)`
+    # sharded along the last axis. Concatenate along the unsharded leading axis before reducing so GSPMD
+    # emits a single cross-device `reduce_or` with zero `all-gather`s.
+    stacked = jnp.concatenate(
+        [jnp.reshape(jnp.asarray(f, dtype=jnp.bool_), (-1, f.shape[-1])) for f in flags],
+        axis=0,
+    )
+    return jnp.any(stacked)
+  return jnp.any(jnp.concatenate([jnp.ravel(jnp.asarray(f, dtype=jnp.bool_)) for f in flags]))
+
+
 def max_expert_shard_load_ratio(group_sizes, num_expert_shards, balanced_load):
   """Largest per-expert-shard load divided by the perfectly balanced load (probe port of MaxText main).
 
@@ -1471,6 +1488,11 @@ class RoutedMoE(nnx.Module):
 
     num_tokens = bsz_times_seq_len * self.num_experts_per_tok
     use_truncated_buffer = use_ragged_in_permute and buffer_size is not None and buffer_size < num_tokens
+    defer_small_all_reduces = (
+        getattr(self.config, "defer_small_all_reduces", False)
+        and self.mesh is not None
+        and bool(self.mesh.axis_names)
+    )
     has_overflow = False
     moe_audit = None
     if use_ragged_in_permute and getattr(self.config, "log_moe_drops", False):
@@ -1490,7 +1512,7 @@ class RoutedMoE(nnx.Module):
         dropped = jnp.maximum(shard_load.astype(jnp.int32) - jnp.int32(buffer_size), 0)
       else:
         dropped = jnp.int32(0)  # dropless: buffer sized for the worst case
-      if self.mesh is not None and self.mesh.axis_names:
+      if self.mesh is not None and self.mesh.axis_names and not defer_small_all_reduces:
         max_load_ratio = jax.lax.pmax(max_load_ratio, tuple(self.mesh.axis_names))
         dropped = jax.lax.psum(dropped, tuple(self.mesh.axis_names))
       moe_audit = (dropped, max_load_ratio)
@@ -1508,7 +1530,7 @@ class RoutedMoE(nnx.Module):
       # Clamp local_group_size to buffer_size to ensure we don't exceed buffer
       # capacity by leveraging the helper _truncate_matrix.
       local_group_size = _truncate_matrix(local_group_size[:, None], buffer_size)[:, 0]
-      if self.mesh is not None and self.mesh.axis_names:
+      if self.mesh is not None and self.mesh.axis_names and not defer_small_all_reduces:
         has_overflow = jax.lax.psum(local_overflow, tuple(self.mesh.axis_names)) > 0
       else:
         has_overflow = local_overflow > 0
@@ -3069,6 +3091,19 @@ class RoutedMoE(nnx.Module):
 
       return output, routing.lb_loss, routing.bias_updates, routing.has_overflow, routing.moe_audit
 
+    defer_small_all_reduces = (
+        getattr(self.config, "defer_small_all_reduces", False)
+        and self.mesh is not None
+        and bool(self.mesh.axis_names)
+    )
+    all_mesh_axes = tuple(self.mesh.axis_names) if defer_small_all_reduces else None
+    has_overflow_out_spec = P(None, all_mesh_axes) if defer_small_all_reduces else P()
+    moe_audit_out_spec = (
+        ((P(None, all_mesh_axes), P(None, all_mesh_axes)),)
+        if defer_small_all_reduces
+        else ((P(), P()),)
+    )
+
     @functools.partial(
         jax.shard_map,
         mesh=self.mesh,
@@ -3093,10 +3128,10 @@ class RoutedMoE(nnx.Module):
             output_pspec,
             P(),  # Handle None or replicate the output
             P(),  # Handle None or replicate the output
-            P(),  # has_overflow: replicated scalar, all-reduced across entire mesh
+            has_overflow_out_spec,  # has_overflow: replicated scalar or per-device 1D flag when deferred
         )
-        # moe_audit (log_moe_drops only): (dropped_assignments psum-reduced, max_load_ratio pmax-reduced) scalars.
-        + (((P(), P()),) if log_moe_drops else ()),
+        # moe_audit (log_moe_drops only): (dropped_assignments, max_load_ratio) scalars or (1, num_devices) when deferred.
+        + (moe_audit_out_spec if log_moe_drops else ()),
         check_vma=self.config.check_vma,
     )
     def sparse_matmul_route_and_compute(
@@ -3347,10 +3382,17 @@ class RoutedMoE(nnx.Module):
 
       force_dropless = getattr(self, "force_dropless", False)
       out, lb_loss, bias_updates, has_overflow, moe_audit = _route_and_compute(force_dropless=force_dropless)
+      if defer_small_all_reduces:
+        has_overflow = jnp.reshape(jnp.asarray(has_overflow, dtype=jnp.bool_), (1, 1))
       if log_moe_drops:
         if moe_audit is None:
           # Flag on but not on the ring-of-experts ragged path: -1 marks "not computed" (never reads as 0).
           moe_audit = (jnp.int32(MOE_AUDIT_NOT_COMPUTED), jnp.float32(MOE_AUDIT_NOT_COMPUTED))
+        if defer_small_all_reduces:
+          moe_audit = (
+              jnp.reshape(jnp.asarray(moe_audit[0], dtype=jnp.int32), (1, 1)),
+              jnp.reshape(jnp.asarray(moe_audit[1], dtype=jnp.float32), (1, 1)),
+          )
         return out, lb_loss, bias_updates, has_overflow, moe_audit
       return out, lb_loss, bias_updates, has_overflow
 

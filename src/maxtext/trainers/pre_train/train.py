@@ -363,9 +363,11 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     )
   has_moe_overflow = jnp.bool_(False)
   if config.retry_when_tokens_dropped:
-    moe_overflow_flags = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "moe_has_overflow")
+    moe_overflow_flags = maxtext_utils.collect_intermediates_by_suffix(
+        intermediate_outputs, "moe_has_overflow", ravel=False
+    )
     if moe_overflow_flags:
-      has_moe_overflow = jnp.any(jnp.stack([jnp.any(x) for x in moe_overflow_flags]))
+      has_moe_overflow = moe.reduce_moe_overflow_flags(moe_overflow_flags)
   aux["has_moe_overflow"] = has_moe_overflow
   return loss, aux
 

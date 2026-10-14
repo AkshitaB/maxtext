@@ -1517,7 +1517,7 @@ def get_nested_value(dictionary, nested_key, default=None):
   return current_level
 
 
-def collect_intermediates_by_suffix(intermediate_outputs, *suffix_keys: str) -> list:
+def collect_intermediates_by_suffix(intermediate_outputs, *suffix_keys: str, ravel: bool = True) -> list:
   """Collects intermediate leaf values whose dict-key path ends with suffix_keys.
 
   Works regardless of model architecture (scanned, scannable blocks, or standard),
@@ -1527,9 +1527,10 @@ def collect_intermediates_by_suffix(intermediate_outputs, *suffix_keys: str) -> 
     intermediate_outputs: The intermediates dict returned by model.apply().
     *suffix_keys: One or more key names forming the expected path suffix,
       e.g. ``("moe_lb_loss",)`` or ``("self_attention", "indexer_loss")``.
+    ravel: Whether to flatten each matching leaf with ``jnp.ravel`` (default True).
 
   Returns:
-    A list of 1-D JAX arrays, one per matching leaf (already ravelled).
+    A list of JAX arrays, one per matching leaf.
   """
   suffix = tuple(suffix_keys)
   n = len(suffix)
@@ -1537,7 +1538,7 @@ def collect_intermediates_by_suffix(intermediate_outputs, *suffix_keys: str) -> 
   for path, val in jax.tree_util.tree_leaves_with_path(intermediate_outputs):
     path_keys = tuple(k.key for k in path if hasattr(k, "key"))
     if len(path_keys) >= n and path_keys[-n:] == suffix:
-      values.append(jnp.ravel(val))
+      values.append(jnp.ravel(val) if ravel else jnp.asarray(val))
   return values
 
 

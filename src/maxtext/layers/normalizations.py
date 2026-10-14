@@ -55,6 +55,54 @@ def _align_scale_with_normalized_axis(scale: jnp.ndarray, y: jnp.ndarray) -> jnp
   )
 
 
+def expand_replicated_scale_for_scan(
+    scale: jnp.ndarray,
+    mesh: jax.sharding.Mesh,
+    batch_axes: tuple[str, ...],
+    seq_axes: tuple[str, ...],
+) -> jnp.ndarray:
+  """Expands a replicated scanned RMSNorm scale along `(batch_axes, seq_axes)` to defer its backward all-reduce.
+
+  In the forward pass, appends two size-1 local dimensions `(..., K, 1, 1)` sharded across
+  `(batch_axes, seq_axes)` so the global shape is `(..., K, batch_shards, seq_shards)` with zero
+  collectives. Inside `RMSNorm.__call__`, the sliced per-layer scale has shape `(K, batch_shards, seq_shards)`
+  and contracts against the local `(batch, seq)` shard of `y` without cross-device reduction inside the
+  scan loop. In the backward pass after the scan loop completes, `_expand_bwd` reduces the full stacked
+  gradient across `batch_axes + seq_axes` in float32 in a single all-reduce.
+  """
+  active_axes = tuple(batch_axes) + tuple(seq_axes)
+  if not active_axes:
+    return scale
+  b_spec = tuple(batch_axes) if len(batch_axes) > 1 else (batch_axes[0] if batch_axes else None)
+  s_spec = tuple(seq_axes) if len(seq_axes) > 1 else (seq_axes[0] if seq_axes else None)
+  in_spec = jax.sharding.PartitionSpec(*(None for _ in range(scale.ndim)))
+  out_spec = jax.sharding.PartitionSpec(*((None,) * scale.ndim + (b_spec, s_spec)))
+  s_dtype = scale.dtype
+
+  @jax.custom_vjp
+  def _expand(s):
+    @jax.shard_map(mesh=mesh, in_specs=in_spec, out_specs=out_spec, check_vma=False)
+    def _fwd(s_local):
+      return jnp.expand_dims(jnp.asarray(s_local, jnp.float32), axis=(-2, -1))
+
+    return _fwd(s)
+
+  def _expand_fwd(s):
+    return _expand(s), ()
+
+  def _expand_bwd(_, g):
+    @jax.shard_map(mesh=mesh, in_specs=out_spec, out_specs=in_spec, check_vma=False)
+    def _bwd(g_local):
+      g_sum = jax.lax.psum(jnp.squeeze(g_local, axis=(-2, -1)), active_axes)
+      return jnp.asarray(g_sum, s_dtype)
+
+    return (_bwd(g),)
+
+  _expand.defvjp(_expand_fwd, _expand_bwd)
+  return _expand(scale)
+
+
+
 class RMSNorm(nnx.Module):
   """RMS normalization."""
 
@@ -115,6 +163,43 @@ class RMSNorm(nnx.Module):
     if self.parameter_memory_host_offload:
       max_logging.log("normalizations.py: Moving scale parameter to device")
       scale = jax.device_put(scale, max_utils.device_space())
+
+    if scale.ndim == 3 and y.ndim >= 3:
+      _, b_sh, s_sh = scale.shape
+      orig_shape = y.shape
+      if orig_shape[0] % b_sh == 0 and orig_shape[1] % s_sh == 0:
+        full_shape = (b_sh, orig_shape[0] // b_sh, s_sh, orig_shape[1] // s_sh) + orig_shape[2:]
+        scale_fp32 = jnp.asarray(scale, jnp.float32) + jnp.float32(self.scale_offset)
+        if self.shard_mode == ShardMode.EXPLICIT:
+          y_sharding = jax.typeof(y).sharding
+          s_partitions = jax.typeof(scale_fp32).sharding.spec.partitions
+          full_sharding = NamedSharding(
+              y_sharding.mesh,
+              jax.sharding.PartitionSpec(
+                  s_partitions[1], None, s_partitions[2], None, *y_sharding.spec.partitions[2:]
+              ),
+          )
+          y_r = jnp.reshape(y, full_shape, out_sharding=full_sharding)
+          out_r = jnp.einsum(
+              "bmsl...k,kbs->bmsl...k",
+              y_r,
+              scale_fp32,
+              precision=lax.Precision.HIGHEST,
+              out_sharding=full_sharding,
+          )
+          out_fp32 = jnp.reshape(
+              out_r, orig_shape, out_sharding=out_sharding if out_sharding is not None else y_sharding
+          )
+        else:
+          y_r = jnp.reshape(y, full_shape)
+          out_r = jnp.einsum(
+              "bmsl...k,kbs->bmsl...k",
+              y_r,
+              scale_fp32,
+              precision=lax.Precision.HIGHEST,
+          )
+          out_fp32 = jnp.reshape(out_r, orig_shape)
+        return jnp.asarray(out_fp32, self.dtype)
 
     scale_fp32 = jnp.asarray(scale, jnp.float32)
     effective_scale = scale_fp32 + jnp.float32(self.scale_offset)

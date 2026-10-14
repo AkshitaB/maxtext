@@ -745,7 +745,21 @@ def collect_moe_audit(model: Any) -> dict[str, jax.Array] | None:
       ("moe_max_load_ratio", "max_ratio", jnp.float32),
   ):
     entries = sorted(found[name], key=lambda e: _natural_key(e[0]))
-    out[key] = jnp.concatenate([jnp.ravel(v).astype(dtype) for _, v in entries])
+    if entries and entries[0][1].ndim >= 2 and entries[0][1].shape[-2] == 1:
+      # Deferred per-device audit (`defer_small_all_reduces=True`): each entry has shape `(..., 1, num_devices)`.
+      # Concatenate all layers first so a single cross-device reduction covers the entire model.
+      all_v = jnp.concatenate([jnp.reshape(v, (-1, v.shape[-1])).astype(dtype) for _, v in entries], axis=0)
+      if key == "dropped":
+        sum_v = jnp.sum(all_v, axis=-1)
+        out[key] = jnp.where(
+            sum_v < 0,
+            jnp.asarray(moe.MOE_AUDIT_NOT_COMPUTED, dtype=dtype),
+            sum_v,
+        )
+      else:
+        out[key] = jnp.max(all_v, axis=-1)
+    else:
+      out[key] = jnp.concatenate([jnp.ravel(v).astype(dtype) for _, v in entries])
   return out
 
 
@@ -1572,7 +1586,10 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
         # Tunix's GRPO/PPO losses (google/tunix#2721); a loss that leaves it on the model is read from there. The
         # aux is read even under has_aux=False, which only stops it being recorded.
         intermediates = nnx.state(mdl, nnx.Intermediate).to_pure_dict()
-        flags = [jnp.any(f) for f in maxtext_utils.collect_intermediates_by_suffix(intermediates, "moe_has_overflow")]
+        raw_flags = maxtext_utils.collect_intermediates_by_suffix(
+            intermediates, "moe_has_overflow", ravel=False
+        )
+        flags = [moe.reduce_moe_overflow_flags(raw_flags)] if raw_flags else []
         aux = _normalize_loss_output(out, has_aux=True).aux_metrics
         if isinstance(aux, dict) and aux.get("has_moe_overflow") is not None:
           flags.append(jnp.asarray(aux["has_moe_overflow"], dtype=jnp.bool_))

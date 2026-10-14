@@ -1063,6 +1063,17 @@ class MoEGeneral(BaseModel):
           "moe_dropped_assignments per step. Adds a scalar psum and pmax per MoE layer call."
       ),
   )
+  defer_small_all_reduces: bool = Field(
+      False,
+      description=(
+          "Defer synchronous small collectives inside scanned decoder layers until after the layer scan: "
+          "(1) keep per-layer MoE `has_overflow` and `log_moe_drops` (`moe_dropped_assignments`, "
+          "`moe_max_load_ratio`) device-local inside `RoutedMoE.permute` / `sparse_matmul` and reduce them "
+          "across the mesh once per micro-batch outside the scan; and (2) expand replicated `RMSNorm.scale` "
+          "parameters across the activation `(batch, sequence)` mesh axes before `jax.lax.scan` so per-layer "
+          "`d_scale` gradients accumulate locally in float32 and execute a single all-reduce after the backward scan."
+      ),
+  )
   first_phase_ragged_buffer_factor: float = Field(
       0.0,
       description=(

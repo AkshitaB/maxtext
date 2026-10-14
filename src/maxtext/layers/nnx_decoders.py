@@ -1182,6 +1182,55 @@ class NNXDecoder(nnx.Module):
       params = maxtext_utils_nnx.nnx_ensure_scan_leading_axis(params, length)
       state = maxtext_utils_nnx.nnx_ensure_scan_leading_axis(state, length)
 
+      if (
+          getattr(self.config, "defer_small_all_reduces", False)
+          and not dynamic_graph_init
+          and not self.config.parameter_memory_host_offload
+          and self.mesh is not None
+          and hasattr(x_in, "shape")
+          and x_in.ndim >= 3
+      ):
+        act_pspec = sharding.logical_to_mesh_axes(
+            ("activation_batch", "activation_norm_length"),
+            self.mesh,
+            rules=self.config.logical_axis_rules,
+        )
+        act_pspec = sharding.adjust_pspec_for_indivisible_shapes(act_pspec, x_in.shape[:2], self.mesh)
+        batch_axes = tuple(a for a in sharding.mesh_axes_for_dim(act_pspec[0]) if self.mesh.shape.get(a, 1) > 1)
+        seq_axes = tuple(a for a in sharding.mesh_axes_for_dim(act_pspec[1]) if self.mesh.shape.get(a, 1) > 1)
+        norm_pspec = sharding.logical_to_mesh_axes(
+            ("norm",), self.mesh, rules=self.config.logical_axis_rules
+        )
+        norm_axes = tuple(a for a in sharding.mesh_axes_for_dim(norm_pspec[0]) if self.mesh.shape.get(a, 1) > 1)
+        active_mesh_axes = {a for a, sz in self.mesh.shape.items() if sz > 1}
+        if (
+            not norm_axes
+            and (batch_axes or seq_axes)
+            and set(batch_axes + seq_axes) == active_mesh_axes
+        ):
+          def _maybe_expand_norm_scale(path, leaf):
+            if (
+                isinstance(leaf, nnx.Param)
+                and path
+                and str(path[-1]) == "scale"
+            ):
+              val = leaf.get_value()
+              if hasattr(val, "ndim") and val.ndim >= 2:
+                val_sharding = getattr(jax.typeof(val), "sharding", None)
+                if val_sharding is None or all(p is None for p in val_sharding.spec.partitions):
+                  return leaf.replace(
+                      value=normalizations.expand_replicated_scale_for_scan(
+                          val, self.mesh, batch_axes, seq_axes
+                      )
+                  )
+            return leaf
+
+          params = jax.tree_util.tree_map_with_path(
+              _maybe_expand_norm_scale,
+              params,
+              is_leaf=lambda x: isinstance(x, nnx.Variable),
+          )
+
       if use_forced_routing:
         scan_xs = (params, state, forced_routed_experts_scanned)
       else:
