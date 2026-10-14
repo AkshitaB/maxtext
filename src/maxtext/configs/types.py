@@ -1553,6 +1553,20 @@ class Qwen3Next(BaseModel):
           " HIGHEST) or with head-sharded context parallelism."
       ),
   )
+  gdn_bwd_single_segment_fast_path: bool = Field(
+      False,
+      description=(
+          "If True, after masking padding tokens on qkv/a/b, runs the GDN kernel and backward pass on the"
+          " single-segment fast path (skipping per-chunk segment mask construction and segment metadata packing)."
+      ),
+  )
+  gdn_fwd_conv_fast_path: bool = Field(
+      False,
+      description=(
+          "If True, uses the unrolled shift-and-multiply depthwise 1D convolution fast path in GDN without"
+          " per-tap segment equality checks."
+      ),
+  )
 
 
 # ----------------------------------------------------------------------------

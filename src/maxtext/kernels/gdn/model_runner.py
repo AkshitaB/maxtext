@@ -163,6 +163,7 @@ def _compute_segmented_conv1d_core(
     conv_state: None | Array,
     conv_halo_seg: None | Array,
     out_dtype: DType,
+    fast_path: bool = False,
 ) -> Array:
   """Core per-tap same-document depthwise Conv1D keeping conv_input in qkv.dtype."""
   batch, seq_len, _ = qkv.shape
@@ -175,20 +176,26 @@ def _compute_segmented_conv1d_core(
   else:
     conv_input = jnp.pad(qkv, ((0, 0), (halo_len, 0), (0, 0)))
 
-  if conv_halo_seg is not None:
-    halo_pos = jnp.maximum(conv_halo_seg.astype(jnp.int32).reshape(batch, halo_len), 0)
-    full_seg = jnp.concatenate([halo_pos, seg_pos], axis=1)
+  if fast_path:
+    conv_out = sum(
+        conv_input[:, k : k + seq_len, :].astype(jnp.float32) * conv_weight_3d[k, 0, :]
+        for k in range(kernel_size)
+    )
   else:
-    full_seg = jnp.pad(seg_pos, ((0, 0), (halo_len, 0)))
+    if conv_halo_seg is not None:
+      halo_pos = jnp.maximum(conv_halo_seg.astype(jnp.int32).reshape(batch, halo_len), 0)
+      full_seg = jnp.concatenate([halo_pos, seg_pos], axis=1)
+    else:
+      full_seg = jnp.pad(seg_pos, ((0, 0), (halo_len, 0)))
 
-  conv_out = sum(
-      (
-          conv_input[:, k : k + seq_len, :].astype(jnp.float32)
-          * ((seg_pos > 0) & (full_seg[:, k : k + seq_len] == seg_pos))[:, :, None].astype(jnp.float32)
-      )
-      * conv_weight_3d[k, 0, :]
-      for k in range(kernel_size)
-  )
+    conv_out = sum(
+        (
+            conv_input[:, k : k + seq_len, :].astype(jnp.float32)
+            * ((seg_pos > 0) & (full_seg[:, k : k + seq_len] == seg_pos))[:, :, None].astype(jnp.float32)
+        )
+        * conv_weight_3d[k, 0, :]
+        for k in range(kernel_size)
+    )
   if conv_bias is not None:
     conv_out = conv_out + conv_bias.astype(jnp.float32)
   conv_out = conv_out * valid_mask
@@ -204,6 +211,7 @@ def segmented_causal_depthwise_conv1d(
     conv_state: None | Array = None,
     conv_halo_seg: None | Array = None,
     dtype: DType | None = None,
+    fast_path: bool = False,
 ) -> Array:
   """Causal depthwise Conv1D with per-tap same-document masking and zero output on padding.
 
@@ -228,7 +236,7 @@ def segmented_causal_depthwise_conv1d(
 
   batch, seq_len, _ = qkv.shape
   seg_2d = jnp.broadcast_to(segment_ids, (batch, seq_len))
-  if conv_halo_seg is None:
+  if conv_halo_seg is None and not fast_path:
     # Raw IDs: canonicalize on the full sequence (before any sequence sharding
     # below), and let a caller conv_state continue the first document.
     seg_2d = gdn_compute_conv1d.canonicalize_segment_ids(seg_2d)
@@ -298,6 +306,7 @@ def segmented_causal_depthwise_conv1d(
               halo_qkv,
               halo_seg,
               out_dtype,
+              fast_path=fast_path,
           )
 
         return _shard_mapped_conv(qkv, conv_weight_3d, conv_bias, seg_2d)
@@ -311,6 +320,7 @@ def segmented_causal_depthwise_conv1d(
       conv_state,
       conv_halo_seg,
       out_dtype,
+      fast_path=fast_path,
   )
 
 
@@ -641,6 +651,12 @@ def run_gdn_kernel_layer(
     qkv = jnp.where(mask.reshape(mask.shape + (1,) * (qkv.ndim - mask.ndim)), qkv, 0.0)
     a = jnp.where(mask[..., None], a, jnp.asarray(-1e4, dtype=a.dtype))
     b = jnp.where(mask[..., None], b, jnp.asarray(-1e4, dtype=b.dtype))
+    if getattr(cfg, "gdn_bwd_single_segment_fast_path", False) or (
+        getattr(cfg, "gdn_fwd_conv_fast_path", False)
+        and model_mode == MODEL_MODE_TRAIN
+        and not getattr(cfg, "packing", True)
+    ):
+      decoder_segment_ids = None
 
   batch, seq_len = qkv.shape[:2]
   conv_kernel_size = cfg.gdn_conv_kernel_dim

@@ -1241,7 +1241,23 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
             segment_ids=packed_segment_ids,
             kernel_size=conv_kernel_size,
             conv_state=conv_state,
+            fast_path=bool(getattr(cfg, "gdn_fwd_conv_fast_path", False)),
         )
+        if flat_sharding is not None:
+          conv_out = jax.sharding.reshard(conv_out, flat_sharding)
+      elif getattr(cfg, "gdn_fwd_conv_fast_path", False):
+        conv_weight_3d = self.conv1d.kernel.value.astype(jnp.float32)
+        if conv_weight_3d.ndim == 2:
+          conv_weight_3d = conv_weight_3d[:, None, :]
+        conv_out = sum(
+            conv_input[:, k : k + seq_len, :].astype(jnp.float32) * conv_weight_3d[k, 0, :]
+            for k in range(conv_kernel_size)
+        )
+        if getattr(self.conv1d, "bias", None) is not None:
+          conv_out = conv_out + self.conv1d.bias.value.astype(jnp.float32)
+        if decoder_segment_ids is not None:
+          conv_out = jnp.where((decoder_segment_ids != 0)[..., None], conv_out, 0.0)
+        conv_out = conv_out.astype(cfg.dtype)
         if flat_sharding is not None:
           conv_out = jax.sharding.reshard(conv_out, flat_sharding)
       else:
@@ -1307,6 +1323,9 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         # key shape after repeat: (B, S, H_v, D_k)
         key = jnp.repeat(key, repeats, axis=2, out_sharding=head_sharding)
 
+      delta_rule_segment_ids = (
+          None if getattr(cfg, "gdn_bwd_single_segment_fast_path", False) else packed_segment_ids
+      )
       if seq_len == 1 and model_mode == MODEL_MODE_AUTOREGRESSIVE:
         core_attn_out, next_recurrent_state = jax_ar_gated_delta_rule(
             query,
@@ -1318,7 +1337,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
             use_qk_norm_in_gdn=cfg.use_qk_norm_in_gdn,
             compute_dtype=cfg.dtype,
         )
-      elif self.mesh is not None and (packed_segment_ids is not None or bool(gdn_context_axes(cfg))):
+      elif self.mesh is not None and (delta_rule_segment_ids is not None or bool(gdn_context_axes(cfg))):
         core_attn_out, next_recurrent_state = gdn_kernel_runner.run_jax_gdn_delta_rule(
             layer=self,
             query=query,
@@ -1328,7 +1347,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
             beta=beta,
             recurrent_state=recurrent_state,
             state_sharding=state_sharding,
-            packed_segment_ids=packed_segment_ids,
+            packed_segment_ids=delta_rule_segment_ids,
             get_logical_axis_rules_fn=get_logical_axis_rules,
             gdn_context_axes_fn=gdn_context_axes,
             delta_rule_fn=jax_chunk_gated_delta_rule,

@@ -53,6 +53,7 @@ def conv1d_silu_fwd(
     segment_ids: Optional[jax.Array] = None,
     conv_halo_seg: Optional[jax.Array] = None,
     output_dtype: Optional[jnp.dtype] = None,
+    fast_conv: bool = False,
 ) -> Tuple[jax.Array, jax.Array]:
   """Forward Conv1D + SiLU returning (conv_out, qkv_conv)."""
   _, seq_len, _ = qkv.shape
@@ -65,7 +66,7 @@ def conv1d_silu_fwd(
     conv_input = jnp.concatenate([conv_state.astype(jnp.float32), qkv.astype(jnp.float32)], axis=1)
   else:
     conv_input = jnp.pad(qkv.astype(jnp.float32), ((0, 0), (kernel_size - 1, 0), (0, 0)))
-  if segment_ids is not None:
+  if segment_ids is not None and not fast_conv:
     valid_mask, tap_masks = _build_conv_tap_masks(segment_ids, kernel_size, conv_halo_seg)
     conv_out = sum(
         (conv_input[:, k : k + seq_len, :] * tap_masks[k]) * conv_weight_3d[k, 0, :] for k in range(kernel_size)
@@ -77,6 +78,9 @@ def conv1d_silu_fwd(
     conv_out = sum(conv_input[:, k : k + seq_len, :] * conv_weight_3d[k, 0, :] for k in range(kernel_size))
     if conv_bias is not None:
       conv_out = conv_out + conv_bias.astype(jnp.float32)
+    if segment_ids is not None:
+      valid_mask = (jnp.maximum(segment_ids.astype(jnp.int32), 0) > 0)[:, :, None].astype(jnp.float32)
+      conv_out = conv_out * valid_mask
   qkv_conv = jax.nn.silu(conv_out)
   return conv_out, qkv_conv.astype(output_dtype or qkv.dtype)
 
@@ -92,6 +96,7 @@ def conv1d_silu_bwd(
     return_d_conv_state: bool = False,
     segment_ids: Optional[jax.Array] = None,
     conv_halo_seg: Optional[jax.Array] = None,
+    fast_conv: bool = False,
 ):
   """Dedicated Conv1D + SiLU backward pass using JAX primitives."""
   _, seq_len, _ = qkv.shape
@@ -107,8 +112,10 @@ def conv1d_silu_bwd(
 
   valid_mask = None
   tap_masks = None
-  if segment_ids is not None:
+  if segment_ids is not None and not fast_conv:
     valid_mask, tap_masks = _build_conv_tap_masks(segment_ids, kernel_size, conv_halo_seg)
+  elif segment_ids is not None:
+    valid_mask = (jnp.maximum(segment_ids.astype(jnp.int32), 0) > 0)[:, :, None].astype(jnp.float32)
 
   if conv_out is None:
     # 1. Forward pass: z = conv1d(x) + b

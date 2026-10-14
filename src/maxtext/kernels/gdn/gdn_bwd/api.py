@@ -61,6 +61,8 @@ def decoupled_conv1d_gdn_bwd_kernel(
     conv_halo_seg: Optional[jax.Array] = None,
     init_seg: Optional[jax.Array] = None,
     interpret: bool | pltpu.InterpretParams | None = None,
+    single_segment_bwd: bool = False,
+    fast_conv: bool = False,
 ) -> Tuple[
     jax.Array,
     jax.Array,
@@ -72,7 +74,7 @@ def decoupled_conv1d_gdn_bwd_kernel(
 ]:
   """Decoupled Conv1D + GDN backward combining Pallas GDN bwd and JAX Conv1D bwd."""
   del seq_lens, qkv
-  if segment_ids is not None and conv_halo_seg is None and init_seg is None:
+  if segment_ids is not None and conv_halo_seg is None and init_seg is None and not (single_segment_bwd and fast_conv):
     segment_ids, conv_halo_seg, init_seg = _local_segment_metadata(segment_ids, conv_state is not None, kernel_size)
   conv_out, qkv_conv = conv1d_silu_fwd(
       qkv=pre_conv_qkv,
@@ -82,6 +84,7 @@ def decoupled_conv1d_gdn_bwd_kernel(
       conv_state=conv_state,
       segment_ids=segment_ids,
       conv_halo_seg=conv_halo_seg,
+      fast_conv=fast_conv,
   )
 
   # pylint: disable=unbalanced-tuple-unpacking
@@ -101,8 +104,8 @@ def decoupled_conv1d_gdn_bwd_kernel(
       use_qk_norm_in_gdn=use_qk_norm_in_gdn,
       vmem_limit_mb=vmem_limit_mb,
       head_tile=head_tile,
-      segment_ids=segment_ids,
-      init_seg=init_seg,
+      segment_ids=None if single_segment_bwd else segment_ids,
+      init_seg=None if single_segment_bwd else init_seg,
       interpret=interpret,
   )
 
@@ -116,6 +119,7 @@ def decoupled_conv1d_gdn_bwd_kernel(
       conv_state=conv_state,
       segment_ids=segment_ids,
       conv_halo_seg=conv_halo_seg,
+      fast_conv=fast_conv,
   )
   # pylint: enable=unbalanced-tuple-unpacking
 
