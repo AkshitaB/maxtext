@@ -1066,6 +1066,12 @@ class NNXDecoder(nnx.Module):
       )
     policy = self.get_remat_policy()
     prevent_cse = maxtext_utils.should_prevent_cse_in_remat(self.config)
+    if (
+        getattr(self.config, "prepare_moe_weights_once_per_step", False)
+        and not getattr(self, "disable_quant_stats_update", False)
+        and not self.config.parameter_memory_host_offload
+    ):
+      moe.prepare_moe_weights_for_step(layers, self.config)
     graphdef, params, state = nnx.split(layers, nnx.Param, ...)
 
     scan_axis = self.config.param_scan_axis
