@@ -76,6 +76,7 @@ def gmm(
     use_gmm_v2: bool = False,
     use_gmm_v2_heuristic_tiling: bool = False,
     partial_sum: jnp.ndarray | None = None,
+    out_3d_fwd: bool = False,
     return_rhs: bool = False,
     return_lhs: bool = False,
     fuse_dlhs_scale: bool = False,
@@ -126,7 +127,7 @@ def gmm(
   gmm_fwd_bwd = lambda *args: _gmm_fwd(*args)[0]  # pylint: disable=C3001
   gmm_fwd_bwd = jax.custom_vjp(
       gmm_fwd_bwd,
-      nondiff_argnums=(3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21),
+      nondiff_argnums=(3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21, 22),
   )
   gmm_fwd_bwd.defvjp(_gmm_fwd, functools.partial(_gmm_bwd, lhs_dtype, rhs_dtype))
   out, lhs_out, rhs_out = gmm_fwd_bwd(
@@ -147,6 +148,7 @@ def gmm(
       rhs_vma_axes,
       use_gmm_v2,
       use_gmm_v2_heuristic_tiling,
+      out_3d_fwd,
       partial_sum,
       return_rhs,
       return_lhs,
@@ -196,6 +198,7 @@ def _gmm_fwd(
     use_gmm_v2: bool = False,
     use_gmm_v2_heuristic_tiling: bool = False,
     partial_sum: jnp.ndarray | None = None,
+    out_3d_fwd: bool = False,
     return_rhs: bool = False,
     return_lhs: bool = False,
     fuse_dlhs_scale: bool = False,
@@ -275,6 +278,7 @@ def _gmm_fwd(
         transpose_rhs,
         interpret,
         lhs_vma_axes,
+        out_3d_fwd=out_3d_fwd,
     )
 
   del return_rhs, return_lhs, fuse_dlhs_scale  # Only used by gmm() and _gmm_bwd.
@@ -496,6 +500,7 @@ def _fwd_run_megablox(
     transpose_rhs: bool,
     interpret: bool,
     lhs_vma_axes: tuple,
+    out_3d_fwd: bool = False,
 ) -> jnp.ndarray:
   """Executes the Megablox backend fallback for forward pass."""
   out = backend.gmm(
@@ -508,6 +513,7 @@ def _fwd_run_megablox(
       existing_out,
       transpose_rhs=transpose_rhs,
       interpret=interpret,
+      out_3d=out_3d_fwd,
   )
   for axis in lhs_vma_axes:
     out = jax.lax.pcast(out, axis_name=axis, to="varying")
@@ -534,6 +540,7 @@ def _gmm_bwd(
     rhs_vma_axes: tuple,
     use_gmm_v2: bool,
     use_gmm_v2_heuristic_tiling: bool,
+    out_3d_fwd: bool,
     return_rhs: bool,
     return_lhs: bool,
     fuse_dlhs_scale: bool,
@@ -977,6 +984,7 @@ def _dlhs_run_megablox(
     transpose_rhs: bool,
     interpret: bool,
     lhs_vma_axes: tuple,
+    out_3d_fwd: bool = False,
 ) -> jnp.ndarray:
   """Executes Megablox fallback for DLHS."""
   return backend.gmm(
@@ -1149,3 +1157,123 @@ def _drhs_run_megablox(
       interpret=interpret,
       varying_axes=rhs_vma_axes,
   )
+
+
+def gmm_dual_up(
+    lhs: jnp.ndarray,
+    rhs0: jnp.ndarray,
+    rhs1: jnp.ndarray,
+    group_sizes: jnp.ndarray,
+    preferred_element_type: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
+    tiling: tuple[int, int, int, int, int, int, int, int, int] = (
+        128,
+        128,
+        128,
+        128,
+        128,
+        128,
+        128,
+        128,
+        128,
+    ),
+    group_offset: jnp.ndarray | None = None,
+    interpret: bool = False,
+    lhs_vma_axes: tuple = tuple(),
+    rhs_vma_axes: tuple = tuple(),
+    out_3d_dlhs: bool = False,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+  """Fused dual up-projection GMM (w0, w1) with in-place DLHS accumulation in backward."""
+  fn = lambda *args: _gmm_dual_up_fwd(*args)[0]  # pylint: disable=C3001
+  fn = jax.custom_vjp(fn, nondiff_argnums=(4, 5, 7, 8, 9, 10))
+  fn.defvjp(_gmm_dual_up_fwd, functools.partial(_gmm_dual_up_bwd, lhs.dtype, rhs0.dtype))
+  return fn(
+      lhs,
+      rhs0,
+      rhs1,
+      group_sizes,
+      preferred_element_type,
+      tiling,
+      group_offset,
+      interpret,
+      lhs_vma_axes,
+      rhs_vma_axes,
+      out_3d_dlhs,
+  )
+
+
+def _gmm_dual_up_fwd(
+    lhs: jnp.ndarray,
+    rhs0: jnp.ndarray,
+    rhs1: jnp.ndarray,
+    group_sizes: jnp.ndarray,
+    preferred_element_type: jnp.dtype,
+    tiling: tuple[int, int, int, int, int, int, int, int, int],
+    group_offset: jnp.ndarray | None,
+    interpret: bool,
+    lhs_vma_axes: tuple,
+    rhs_vma_axes: tuple,
+    out_3d_dlhs: bool,
+):
+  """Forward pass for custom_vjp of dual grouped matrix multiplication."""
+  del rhs_vma_axes, out_3d_dlhs
+  out0 = _fwd_run_megablox(
+      lhs, rhs0, group_sizes, preferred_element_type, tiling, group_offset, None, False, interpret, lhs_vma_axes
+  )
+  out1 = _fwd_run_megablox(
+      lhs, rhs1, group_sizes, preferred_element_type, tiling, group_offset, None, False, interpret, lhs_vma_axes
+  )
+  return (out0, out1), (lhs, rhs0, rhs1, group_sizes, group_offset)
+
+
+def _gmm_dual_up_bwd(
+    lhs_dtype: jax.typing.DTypeLike,
+    rhs_dtype: jax.typing.DTypeLike,
+    preferred_element_type: jnp.dtype,
+    tiling: tuple[int, int, int, int, int, int, int, int, int],
+    interpret: bool,
+    lhs_vma_axes: tuple,
+    rhs_vma_axes: tuple,
+    out_3d_dlhs: bool,
+    residual,
+    grads,
+):
+  """Backward function for dual up-projection GMM with in-place DLHS accumulation."""
+  del preferred_element_type
+  lhs, rhs0, rhs1, group_sizes, group_offset = residual
+  dy0, dy1 = grads
+  num_actual_groups = rhs0.shape[0]
+  dx0 = backend.gmm(
+      dy0,
+      rhs0,
+      group_sizes,
+      lhs_dtype,
+      tiling[3:6],
+      group_offset,
+      transpose_rhs=True,
+      interpret=interpret,
+      varying_axes=lhs_vma_axes,
+      out_3d=out_3d_dlhs,
+  )
+  dx = backend.gmm(
+      dy1,
+      rhs1,
+      group_sizes,
+      lhs_dtype,
+      tiling[3:6],
+      group_offset,
+      existing_out=dx0,
+      transpose_rhs=True,
+      interpret=interpret,
+      varying_axes=lhs_vma_axes,
+      accumulate_out=True,
+      out_3d=out_3d_dlhs,
+  )
+  if out_3d_dlhs:
+    dx = dx.reshape(lhs.shape)
+  drhs0 = _drhs_run_megablox(
+      dy0, lhs, group_sizes, group_offset, num_actual_groups, rhs_dtype, tiling, interpret, rhs_vma_axes
+  )
+  drhs1 = _drhs_run_megablox(
+      dy1, lhs, group_sizes, group_offset, num_actual_groups, rhs_dtype, tiling, interpret, rhs_vma_axes
+  )
+  return dx, drhs0, drhs1, None, None
