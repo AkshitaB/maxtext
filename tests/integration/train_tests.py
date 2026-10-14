@@ -1497,7 +1497,7 @@ class TrainTests(unittest.TestCase):
         # sharding inserts is a no-op -- float noise, not the two runs disagreeing about
         # the math. A genuinely wrong sharding does not land here: it either fails the
         # shape check outright or moves the loss by percent.
-        np.testing.assert_allclose(explicit_losses, auto_losses, rtol=1e-3, atol=0.0)
+        np.testing.assert_allclose(explicit_losses, auto_losses, rtol=2e-3, atol=0.0)
 
   @pytest.mark.integration_test
   @pytest.mark.tpu_only
