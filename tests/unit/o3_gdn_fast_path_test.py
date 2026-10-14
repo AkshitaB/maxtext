@@ -107,7 +107,7 @@ class O3GdnFastPathTest(unittest.TestCase):
     np.testing.assert_array_equal(np.asarray(db_fast), np.asarray(db_ref))
 
   def test_decoupled_conv1d_gdn_bwd_kernel_single_segment_fast_path_parity(self):
-    """`decoupled_conv1d_gdn_bwd_kernel` with `single_segment_bwd=True, fast_conv=True` is bit-identical on single-segment."""
+    """`decoupled_conv1d_gdn_bwd_kernel(single_segment_bwd=True, fast_conv=True)` is bit-identical on one segment."""
     key = jax.random.PRNGKey(42)
     keys = jax.random.split(key, 7)
     batch, seq_len, chunk_size = 2, 64, 64
@@ -126,26 +126,7 @@ class O3GdnFastPathTest(unittest.TestCase):
     do = jax.random.normal(keys[5], (batch, seq_len, num_v_heads, head_v_dim), dtype=jnp.float32) * 0.1
     segment_ids = jnp.ones((batch, seq_len), dtype=jnp.int32)
 
-    _, chunk_states, t_inv = jax_compute_gdn_states._compute_forward_conv_and_states(
-        qkv=qkv,
-        b=b,
-        a=a,
-        conv_weight=conv_weight,
-        conv_bias=conv_bias,
-        a_log=a_log,
-        dt_bias=dt_bias,
-        recurrent_state=None,
-        conv_state=None,
-        num_k_heads=num_k_heads,
-        num_v_heads=num_v_heads,
-        head_k_dim=head_k_dim,
-        head_v_heads_dim=head_v_dim,
-        conv_kernel_size=kernel_size,
-        chunk_size=chunk_size,
-        use_qk_norm_in_gdn=True,
-        compute_dtype=jnp.float32,
-        segment_ids=None,
-    ) if "head_v_heads_dim" in jax_compute_gdn_states._compute_forward_conv_and_states.__code__.co_varnames else jax_compute_gdn_states._compute_forward_conv_and_states(
+    _, chunk_states, t_inv = jax_compute_gdn_states._compute_forward_conv_and_states(  # pylint: disable=protected-access
         qkv=qkv,
         b=b,
         a=a,

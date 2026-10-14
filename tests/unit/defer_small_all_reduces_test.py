@@ -141,12 +141,8 @@ def _check_scanned_rmsnorm_deferral(mesh):
     sl_moved = jnp.moveaxis(sl, 1, 0)
     sg_moved = jnp.moveaxis(sg, 1, 0)
     if defer:
-      sl_moved = normalizations.expand_replicated_scale_for_scan(
-          sl_moved, mesh, ("fsdp", "expert"), ("context",)
-      )
-      sg_moved = normalizations.expand_replicated_scale_for_scan(
-          sg_moved, mesh, ("fsdp", "expert"), ("context",)
-      )
+      sl_moved = normalizations.expand_replicated_scale_for_scan(sl_moved, mesh, ("fsdp", "expert"), ("context",))
+      sg_moved = normalizations.expand_replicated_scale_for_scan(sg_moved, mesh, ("fsdp", "expert"), ("context",))
 
     def outer_body(carry, xs):
       sl_b, sg_b = xs
@@ -163,7 +159,9 @@ def _check_scanned_rmsnorm_deferral(mesh):
     return jnp.sum(out.astype(jnp.float32)), out
 
   with jax.set_mesh(mesh):
-    fn_base = jax.jit(jax.value_and_grad(lambda inp, sl, sg: run_scan(inp, sl, sg, False), argnums=(0, 1, 2), has_aux=True))
+    fn_base = jax.jit(
+        jax.value_and_grad(lambda inp, sl, sg: run_scan(inp, sl, sg, False), argnums=(0, 1, 2), has_aux=True)
+    )
     fn_def = jax.jit(jax.value_and_grad(lambda inp, sl, sg: run_scan(inp, sl, sg, True), argnums=(0, 1, 2), has_aux=True))
     hlo_base = fn_base.lower(x, s_local, s_global).compile().as_text()
     hlo_def = fn_def.lower(x, s_local, s_global).compile().as_text()
@@ -216,26 +214,19 @@ def main():
   ):
     np.testing.assert_array_equal(g_b, g_d, err_msg=f"grad mismatch at {path_b} vs {path_d}")
 
-  b_fwd_shmap_ars = [
-      l for l in hlo_b.splitlines() if "all-reduce(" in l and "jvp()/shard_map/p" in l
-  ]
-  d_fwd_shmap_ars = [
-      l for l in hlo_d.splitlines() if "all-reduce(" in l and "jvp()/shard_map/p" in l
-  ]
-  d_pred_ags = [
-      l for l in hlo_d.splitlines() if "all-gather(" in l and "pred[" in l
-  ]
+  b_fwd_shmap_ars = [l for l in hlo_b.splitlines() if "all-reduce(" in l and "jvp()/shard_map/p" in l]
+  d_fwd_shmap_ars = [l for l in hlo_d.splitlines() if "all-reduce(" in l and "jvp()/shard_map/p" in l]
+  d_pred_ags = [l for l in hlo_d.splitlines() if "all-gather(" in l and "pred[" in l]
   print(
-      f"2-layer MoE jvp/shard_map all-reduces: base={len(b_fwd_shmap_ars)}, defer={len(d_fwd_shmap_ars)}; pred all-gathers={len(d_pred_ags)}",
+      f"2-layer MoE jvp/shard_map all-reduces: base={len(b_fwd_shmap_ars)}, defer={len(d_fwd_shmap_ars)}; "
+      f"pred all-gathers={len(d_pred_ags)}",
       flush=True,
   )
   assert len(b_fwd_shmap_ars) >= 2, f"expected per-layer psum/pmax in baseline, got {b_fwd_shmap_ars}"
-  assert len(d_fwd_shmap_ars) == 0, (
-      f"defer_small_all_reduces=True must eliminate all jvp()/shard_map all-reduces, got {d_fwd_shmap_ars}"
-  )
-  assert len(d_pred_ags) == 0, (
-      f"defer_small_all_reduces=True must not emit pred all-gathers, got {d_pred_ags}"
-  )
+  assert (
+      len(d_fwd_shmap_ars) == 0
+  ), f"defer_small_all_reduces=True must eliminate all jvp()/shard_map all-reduces, got {d_fwd_shmap_ars}"
+  assert len(d_pred_ags) == 0, f"defer_small_all_reduces=True must not emit pred all-gathers, got {d_pred_ags}"
 
   _check_scanned_rmsnorm_deferral(mesh)
   print(_PASS_TOKEN, flush=True)

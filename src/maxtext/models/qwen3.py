@@ -260,6 +260,7 @@ def segmented_causal_depthwise_conv1d(
     conv_state: None | Array = None,
     conv_halo_seg: None | Array = None,
     dtype: DType | None = None,
+    fast_path: bool = False,
 ) -> Array:
   """Causal depthwise Conv1D with per-tap same-document masking and zero output on padding."""
   return gdn_kernel_runner.segmented_causal_depthwise_conv1d(
@@ -271,6 +272,7 @@ def segmented_causal_depthwise_conv1d(
       conv_state=conv_state,
       conv_halo_seg=conv_halo_seg,
       dtype=dtype,
+      fast_path=fast_path,
   )
 
 
@@ -1323,9 +1325,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         # key shape after repeat: (B, S, H_v, D_k)
         key = jnp.repeat(key, repeats, axis=2, out_sharding=head_sharding)
 
-      delta_rule_segment_ids = (
-          None if getattr(cfg, "gdn_bwd_single_segment_fast_path", False) else packed_segment_ids
-      )
+      delta_rule_segment_ids = None if getattr(cfg, "gdn_bwd_single_segment_fast_path", False) else packed_segment_ids
       if seq_len == 1 and model_mode == MODEL_MODE_AUTOREGRESSIVE:
         core_attn_out, next_recurrent_state = jax_ar_gated_delta_rule(
             query,

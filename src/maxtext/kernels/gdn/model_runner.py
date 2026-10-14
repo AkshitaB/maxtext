@@ -178,8 +178,7 @@ def _compute_segmented_conv1d_core(
 
   if fast_path:
     conv_out = sum(
-        conv_input[:, k : k + seq_len, :].astype(jnp.float32) * conv_weight_3d[k, 0, :]
-        for k in range(kernel_size)
+        conv_input[:, k : k + seq_len, :].astype(jnp.float32) * conv_weight_3d[k, 0, :] for k in range(kernel_size)
     )
   else:
     if conv_halo_seg is not None:

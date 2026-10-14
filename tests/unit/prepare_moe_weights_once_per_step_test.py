@@ -36,7 +36,6 @@ from jax.sharding import Mesh
 import numpy as np
 import pytest
 
-from maxtext.configs import pyconfig
 from maxtext.layers import linears
 from maxtext.layers import moe
 from maxtext.utils import maxtext_utils
@@ -91,6 +90,7 @@ def _build_routed_moe(cfg, mesh):
 
 
 def _run_step(cfg, mesh, params, x, forced):
+  """Runs one jitted forward/backward step; returns loss, output, param/input grads and the lowered HLO."""
   with jax.set_mesh(mesh), nn_partitioning.axis_rules(cfg.logical_axis_rules):
     layer = _build_routed_moe(cfg, mesh)
     graphdef, _, rest = nnx.split(layer, nnx.Param, ...)
@@ -166,12 +166,12 @@ def main():
       f"wi dim-2 concats: base={len(b_wi_concats)}, w3a={len(w_wi_concats)}",
       flush=True,
   )
-  assert len(b_fp8_barriers) == 6 and len(w_fp8_barriers) == 2, (
-      f"expected 6->2 FP8 fake-quant opt-barriers with W3a, got {len(b_fp8_barriers)}->{len(w_fp8_barriers)}"
-  )
-  assert len(w_wi_concats) < len(b_wi_concats), (
-      f"expected fewer wi dim-2 concatenations with pre-fused wi in W3a ({len(w_wi_concats)} vs {len(b_wi_concats)})"
-  )
+  assert (
+      len(b_fp8_barriers) == 6 and len(w_fp8_barriers) == 2
+  ), f"expected 6->2 FP8 fake-quant opt-barriers with W3a, got {len(b_fp8_barriers)}->{len(w_fp8_barriers)}"
+  assert len(w_wi_concats) < len(
+      b_wi_concats
+  ), f"expected fewer wi dim-2 concatenations with pre-fused wi in W3a ({len(w_wi_concats)} vs {len(b_wi_concats)})"
   print(_PASS_TOKEN, flush=True)
 
 

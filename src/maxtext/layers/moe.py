@@ -1490,9 +1490,7 @@ class RoutedMoE(nnx.Module):
     num_tokens = bsz_times_seq_len * self.num_experts_per_tok
     use_truncated_buffer = use_ragged_in_permute and buffer_size is not None and buffer_size < num_tokens
     defer_small_all_reduces = (
-        getattr(self.config, "defer_small_all_reduces", False)
-        and self.mesh is not None
-        and bool(self.mesh.axis_names)
+        getattr(self.config, "defer_small_all_reduces", False) and self.mesh is not None and bool(self.mesh.axis_names)
     )
     has_overflow = False
     moe_audit = None
@@ -3100,17 +3098,11 @@ class RoutedMoE(nnx.Module):
       return output, routing.lb_loss, routing.bias_updates, routing.has_overflow, routing.moe_audit
 
     defer_small_all_reduces = (
-        getattr(self.config, "defer_small_all_reduces", False)
-        and self.mesh is not None
-        and bool(self.mesh.axis_names)
+        getattr(self.config, "defer_small_all_reduces", False) and self.mesh is not None and bool(self.mesh.axis_names)
     )
     all_mesh_axes = tuple(self.mesh.axis_names) if defer_small_all_reduces else None
     has_overflow_out_spec = P(None, all_mesh_axes) if defer_small_all_reduces else P()
-    moe_audit_out_spec = (
-        ((P(None, all_mesh_axes), P(None, all_mesh_axes)),)
-        if defer_small_all_reduces
-        else ((P(), P()),)
-    )
+    moe_audit_out_spec = ((P(None, all_mesh_axes), P(None, all_mesh_axes)),) if defer_small_all_reduces else ((P(), P()),)
 
     @functools.partial(
         jax.shard_map,
@@ -4905,4 +4897,4 @@ def prepare_moe_weights_for_step(root_module: nnx.Module, config: ctypes.Config)
       module.wi_1.set_value(_fake_quantize_moe_weight_stack(wi_1_val))
     wo_val = jnp.asarray(module.wo.get_value(), dtype=module.dtype)
     module.wo.set_value(_fake_quantize_moe_weight_stack(wo_val))
-    module._weights_preprepared_for_step = True
+    module._weights_preprepared_for_step = True  # pylint: disable=protected-access

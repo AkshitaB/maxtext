@@ -1590,9 +1590,7 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
         # Tunix's GRPO/PPO losses (google/tunix#2721); a loss that leaves it on the model is read from there. The
         # aux is read even under has_aux=False, which only stops it being recorded.
         intermediates = nnx.state(mdl, nnx.Intermediate).to_pure_dict()
-        raw_flags = maxtext_utils.collect_intermediates_by_suffix(
-            intermediates, "moe_has_overflow", ravel=False
-        )
+        raw_flags = maxtext_utils.collect_intermediates_by_suffix(intermediates, "moe_has_overflow", ravel=False)
         flags = [moe.reduce_moe_overflow_flags(raw_flags)] if raw_flags else []
         aux = _normalize_loss_output(out, has_aux=True).aux_metrics
         if isinstance(aux, dict) and aux.get("has_moe_overflow") is not None:

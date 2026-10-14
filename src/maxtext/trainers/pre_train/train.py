@@ -56,6 +56,7 @@ from maxtext.utils import elastic_utils
 # pylint: disable=too-many-positional-arguments
 from maxtext.layers.multi_token_prediction import calculate_mtp_acceptance_rate, calculate_mtp_loss, mtp_acceptance, mtp_losses
 from maxtext.layers.attention_mla import indexer_losses
+from maxtext.layers import moe
 from maxtext.common import checkpointing, profiler
 from maxtext.common.goodput import (
     GoodputEvent,

@@ -102,7 +102,6 @@ def expand_replicated_scale_for_scan(
   return _expand(scale)
 
 
-
 class RMSNorm(nnx.Module):
   """RMS normalization."""
 
@@ -175,9 +174,7 @@ class RMSNorm(nnx.Module):
           s_partitions = jax.typeof(scale_fp32).sharding.spec.partitions
           full_sharding = NamedSharding(
               y_sharding.mesh,
-              jax.sharding.PartitionSpec(
-                  s_partitions[1], None, s_partitions[2], None, *y_sharding.spec.partitions[2:]
-              ),
+              jax.sharding.PartitionSpec(s_partitions[1], None, s_partitions[2], None, *y_sharding.spec.partitions[2:]),
           )
           y_r = jnp.reshape(y, full_shape, out_sharding=full_sharding)
           out_r = jnp.einsum(
@@ -187,9 +184,7 @@ class RMSNorm(nnx.Module):
               precision=lax.Precision.HIGHEST,
               out_sharding=full_sharding,
           )
-          out_fp32 = jnp.reshape(
-              out_r, orig_shape, out_sharding=out_sharding if out_sharding is not None else y_sharding
-          )
+          out_fp32 = jnp.reshape(out_r, orig_shape, out_sharding=out_sharding if out_sharding is not None else y_sharding)
         else:
           y_r = jnp.reshape(y, full_shape)
           out_r = jnp.einsum(
