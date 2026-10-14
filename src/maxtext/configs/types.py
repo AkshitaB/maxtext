@@ -1957,6 +1957,13 @@ class RematAndOffload(BaseModel):
           "and use_ragged_sort=True (remat, device, offload)."
       ),
   )
+  moe_route_tiled: bool = Field(
+      False,
+      description=(
+          "Reshape 1D `moe_route` integer arrays to `(-1, 128)` tiles before applying `checkpoint_name` so "
+          "device/host saves operate on whole tiles."
+      ),
+  )
   query_proj: RematLocation = Field(RematLocation.REMAT, description="Remat policy for the query projection.")
   key_proj: RematLocation = Field(RematLocation.REMAT, description="Remat policy for the key projection.")
   value_proj: RematLocation = Field(RematLocation.REMAT, description="Remat policy for the value projection.")

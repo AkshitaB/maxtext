@@ -21,6 +21,26 @@ from maxtext.kernels.ragged.ragged_gather import ragged_gather
 from maxtext.kernels.ragged.ragged_gather_reduce_v2 import ragged_gather_reduce
 
 
+def _checkpoint_moe_route(x: jax.Array, tiled: bool = False, name: str = "moe_route") -> jax.Array:
+  """Tags a 1D routing index/count array with the `moe_route` remat checkpoint name.
+
+  When `tiled=True`, pads the 1D array to a multiple of 128 and reshapes to `(-1, 128)` before
+  tagging so TPU HBM/host saves operate on whole `(8, 128)` tiles without sub-tile padding waste,
+  then restores the original 1D shape.
+  """
+  if not tiled or x.ndim != 1:
+    return checkpoint_name(x, name)
+  orig_len = x.shape[0]
+  rem = orig_len % 128
+  if rem:
+    x = jnp.pad(x, (0, 128 - rem))
+  x = checkpoint_name(jnp.reshape(x, (-1, 128)), name)
+  x = jnp.reshape(x, (-1,))
+  if rem:
+    x = x[:orig_len]
+  return x
+
+
 def ring_ragged_sort(
     hidden_states_local,
     topk_indices_local,
@@ -36,6 +56,7 @@ def ring_ragged_sort(
     gather_bytes_accessed_override=-1,
     gather_reduce_bytes_accessed_override=-1,
     use_single_sparsecore=False,
+    moe_route_tiled=False,
 ):
   """Ragged-gather variant for AG-RS Expert Parallelism token routing.
 
@@ -96,9 +117,9 @@ def ring_ragged_sort(
     topk_argsort_revert_indices = jnp.argsort(topk_argsort_indices)  # num_tokens_local x topk
     # Named for the `moe_route` remat key. Saving these integer results lets the backward replay
     # the token gather, whose output the expert GMMs need again, without replaying both argsorts.
-    token_indices_sorted = checkpoint_name(token_indices_sorted, "moe_route")
-    group_sizes_local = checkpoint_name(group_sizes_local, "moe_route")
-    topk_argsort_revert_indices = checkpoint_name(topk_argsort_revert_indices, "moe_route")
+    token_indices_sorted = _checkpoint_moe_route(token_indices_sorted, tiled=moe_route_tiled)
+    group_sizes_local = _checkpoint_moe_route(group_sizes_local, tiled=moe_route_tiled)
+    topk_argsort_revert_indices = _checkpoint_moe_route(topk_argsort_revert_indices, tiled=moe_route_tiled)
     shard_idx = jax.lax.axis_index(ep_name)
 
     local_num_experts = num_experts // ep_size
