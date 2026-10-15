@@ -843,6 +843,12 @@ class LogitsAndLoss(BaseModel):
   fused_lm_head_ce_vmem_limit_mib: int = Field(
       0, description="Fused LM-head CE: Mosaic scoped VMEM limit in MiB (0 = compiler default)."
   )
+  vocab_tiling_seq_major: bool = Field(
+      False,
+      description="Cut the vocab tiles along the sequence, so every tile holds a slice of each sequence and each"
+      " device keeps its own tokens. The default cuts the flattened batch, which puts a whole sequence in one tile"
+      " and, at one sequence per device, makes XLA reshard the hidden states through a full all-gather.",
+  )
 
 
 class Attention(BaseModel):
@@ -3292,6 +3298,11 @@ class Optimizer(BaseModel):
   use_tunix_gradient_accumulation: bool = Field(
       False,
       description="Whether to use the Tunix implementation for gradient accumulation.",
+  )
+  ga_params_loop_barrier: bool = Field(
+      False,
+      description="Tie the params to each micro-batch inside the gradient accumulation scan, so XLA can't hoist"
+      " loop-invariant work on them (FSDP all-gathers, casts) out of the loop and keep it live across micro-batches.",
   )
   gradient_clipping_threshold: NonNegativeFloat = Field(
       1.0, description="The threshold for gradient clipping. 0 disables clipping."
