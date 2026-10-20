@@ -204,7 +204,7 @@ class OLMoE3KimiDeltaAttention(nnx.Module):
     heads, dk, dv = self.num_heads, self.head_k_dim, self.head_v_dim
 
     # An fp32 conv weight otherwise promotes q/k/v (and their kernel residuals) to fp32.
-    cast = self.config.kda_conv_in_compute_dtype
+    cast = self.config.kda_conv_in_compute_dtype or self.config.kda_bf16_inputs
     q_conv, k_conv, v_conv = (w[...].astype(x.dtype) if cast else w[...] for w in (self.q_conv, self.k_conv, self.v_conv))
     if self.fused_input_proj:
       q_in, k_in, v_in, f_in, g_in, b_in = self._fused_input_proj(x)
@@ -320,14 +320,21 @@ class OLMoE3KimiDeltaAttention(nnx.Module):
 
     q = self._head_norm(q, mean=False, eps=1e-6, scale=dk**-0.5, out_dtype=f32)
     k = self._head_norm(k, mean=False, eps=1e-6, out_dtype=f32)
-    neg_a = jnp.repeat(-jnp.exp(self.A_log[...].astype(f32)), dk)  # [H * dk]
-    log_decay = neg_a * jax.nn.softplus(raw_g.astype(f32) + self.dt_bias[...].astype(f32))
+    a_log, dt_bias = self.A_log[...], self.dt_bias[...]
+    if cfg.kda_bf16_inputs:
+      # OLMo-core casts the whole model to bf16 for the forward, so its gate sees bf16 A_log and dt_bias; the
+      # gate arithmetic itself stays f32.
+      a_log, dt_bias = a_log.astype(jnp.bfloat16), dt_bias.astype(jnp.bfloat16)
+    neg_a = jnp.repeat(-jnp.exp(a_log.astype(f32)), dk)  # [H * dk]
+    log_decay = neg_a * jax.nn.softplus(raw_g.astype(f32) + dt_bias.astype(f32))
 
     resets = kda.segment_resets(decoder_segment_ids, batch, seq_len)
 
     c = cfg.gdn_chunk_size
     n = seq_len // c
-    compute_dtype = jnp.bfloat16 if cfg.gdn_state_dtype == "bfloat16" else f32
+    # The kernel rounds its matmul operands to bf16 either way; kda_bf16_inputs hands it bf16 q, k, v (half the
+    # HBM traffic and residuals) while gdn_state_dtype still decides whether the carried state is f32.
+    compute_dtype = jnp.bfloat16 if cfg.gdn_state_dtype == "bfloat16" or cfg.kda_bf16_inputs else f32
     seg = jnp.cumsum(resets.reshape(batch, n, c).astype(jnp.int32), axis=-1)[:, None]  # [B, 1, N, C]
     g_last = log_decay.reshape(batch, n, c, heads * dk).sum(axis=2)  # [B, N, H * dk]
     g_last = g_last.reshape(batch, n, heads, dk).transpose(0, 2, 1, 3)  # [B, H, N, dk] (small)

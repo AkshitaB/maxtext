@@ -1430,6 +1430,54 @@ class OLMoE3FusedKDAModuleTest(unittest.TestCase):
         # The kernel rounds its matmul operands to bf16; the f32 XLA path (dtype=float32 here) does not.
         self.assertLess(float(rel), 6.5e-2, f"token_major={tm}: grad rel err {rel:.2e}")
 
+  def _fwd_kernel_input_dtypes(self, extra):
+    """dtypes of q, k, v at the forward fused-KDA pallas_call, traced through the layer's loss."""
+    # pylint: disable=g-import-not-at-top,import-outside-toplevel
+    from flax import nnx
+    from maxtext.models.olmoe3 import OLMoE3KimiDeltaAttention
+
+    x = jax.random.normal(jax.random.PRNGKey(3), (2, 128, 128), jnp.float32)
+    segments = jnp.ones((2, 128), jnp.int32)
+    cfg = _config(
+        "olmoe3-30m",
+        max_target_length=128,
+        extra=("use_tokamax_kda=False", "kda_chunked_impl=subblock", "gdn_state_dtype=float32", *extra),
+    )
+    mesh = Mesh(maxtext_utils.create_device_mesh(cfg), cfg.mesh_axes)
+    with mesh:
+      layer = OLMoE3KimiDeltaAttention(cfg, mesh, None, rngs=nnx.Rngs(params=0))
+      graphdef, state = nnx.split(layer)
+      jaxpr = jax.make_jaxpr(lambda s_, x_: jnp.sum(nnx.merge(graphdef, s_)(x_, segments)))(state, x)
+
+    found = []
+
+    def walk(jx):
+      for eqn in jx.eqns:
+        if eqn.primitive.name == "pallas_call" and len(eqn.outvars[0].aval.shape) == 3:
+          found.append(tuple(v.aval.dtype for v in eqn.invars[:3]))
+        for sub in _sub_jaxprs(eqn.params):
+          walk(sub)
+
+    walk(jaxpr.jaxpr)
+    self.assertEqual(len(found), 1)
+    return found[0]
+
+  def test_bf16_inputs_feed_the_kernel_bf16_and_keep_the_values(self):
+    """``kda_bf16_inputs``: bf16 q/k/v into the flat-head fused kernel (f32 state kept), same values within bf16."""
+    flat = ("kda_pallas_fused=True", "kda_fused_token_major=True", "kda_outer_block=32", "kda_flat_head_layout=True")
+    self.assertEqual(self._fwd_kernel_input_dtypes(flat), (jnp.float32,) * 3)
+    self.assertEqual(self._fwd_kernel_input_dtypes((*flat, "kda_bf16_inputs=True")), (jnp.bfloat16,) * 3)
+    v_ref, g_ref = self._run(flat)
+    v, g = self._run((*flat, "kda_bf16_inputs=True"))
+    self.assertAlmostEqual(v_ref, v, delta=1e-2 * abs(v_ref))
+    for a, b in zip(g_ref, g):
+      rel = jnp.linalg.norm(a - b) / (jnp.linalg.norm(a) + 1e-30)
+      self.assertLess(float(rel), 6.5e-2, f"grad rel err {rel:.2e}")
+
+  def test_bf16_inputs_requires_the_flat_fused_path(self):
+    with self.assertRaisesRegex(ValueError, "kda_bf16_inputs needs the flat-head fused KDA path"):
+      _config("olmoe3-30m", extra=("use_tokamax_kda=False", "kda_chunked_impl=subblock", "kda_bf16_inputs=True"))
+
   def test_kda_fused_device_skips_forward_recompute(self):
     fused = ("kda_pallas_fused=True", "kda_fused_token_major=True", "kda_outer_block=32", "remat_policy=custom")
     self.assertEqual(self._run((*fused, "kda_fused=remat"), count_kernels=True), 2)

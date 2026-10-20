@@ -1974,6 +1974,15 @@ class Qwen3Next(BaseModel):
       " differently on TPU, so the [B, T, H, d] round trips around the kernel (and their gradients) are relayout"
       " copies; per-head reductions run in kernels/head_norm.py. Same math.",
   )
+  kda_bf16_inputs: bool = Field(
+      False,
+      description=(
+          "Flat-head fused KDA (kda_flat_head_layout with kda_pallas_fused): pass q, k, v to the kernel in bf16, cast"
+          " the short-conv weights to bf16 and use bf16-rounded A_log and dt_bias (the gate math stays f32), as"
+          " OLMo-core runs KDA after casting the model to bf16. The kernel rounds its matmul operands to bf16 anyway;"
+          " gdn_state_dtype still sets the carried state's precision (float32 keeps it f32)."
+      ),
+  )
   kda_outer_block: int = Field(
       0,
       description="With kda_pallas_fused, rows per outer block of a two-level intra-chunk factorization (0: one"
@@ -4650,6 +4659,22 @@ class MaxTextConfig(
           f"Found other ICI axes enabled: {active}."
       )
 
+  def validate_kda_bf16_inputs(self):
+    """kda_bf16_inputs is implemented on the flat-head fused KDA path only; refuse it where it would do nothing."""
+    if not self.kda_bf16_inputs:
+      return
+    if not (
+        self.kda_flat_head_layout
+        and self.kda_pallas_fused
+        and self.kda_fused_token_major
+        and self.kda_chunked_impl == "subblock"
+        and not self.use_tokamax_kda
+    ):
+      raise ValueError(
+          "kda_bf16_inputs needs the flat-head fused KDA path: kda_flat_head_layout, kda_pallas_fused and"
+          " kda_fused_token_major True, kda_chunked_impl='subblock', use_tokamax_kda=False."
+      )
+
   def validate_moe_dropless_fallback(self):
     """Validates prerequisites for the step-level ('step') and in-layer ('layer') dropless fallback."""
     mode = self.moe_dropless_fallback
@@ -6030,6 +6055,7 @@ class MaxTextConfig(
       self.validate_moe_log_max_load_ratio()
       self.validate_moe_tc_ragged_sort()
     self.validate_num_moe_emb_chunks()
+    self.validate_kda_bf16_inputs()
     self.validate_moe_quantize_token_all_gather()
     self.validate_moe_topk_before_ep_all_gather()
     self.validate_moe_quantize_combine_bwd_method()

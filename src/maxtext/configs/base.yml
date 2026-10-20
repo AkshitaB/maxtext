@@ -1650,6 +1650,9 @@ kda_fused_token_major: false
 # With kda_fused_token_major, keep KDA activations head-flattened ([B, T, H * d]) end to end: no
 # [B, T, H, d] relayout copies around the kernel or in the output norm/gate (same math).
 kda_flat_head_layout: false
+# Flat-head fused KDA: bf16 q/k/v into the kernel, bf16 short-conv weights and bf16-rounded A_log/dt_bias, as
+# OLMo-core (which casts the model to bf16) runs them. The state precision still follows gdn_state_dtype.
+kda_bf16_inputs: false
 # With kda_fused=device/offload, save the KDA chunk state of every k-th chunk (1 all, 2 half, 0 none; the bwd rebuilds the rest).
 kda_fused_state_stride: 2
 # With kda_fused=device/offload: 'all' saves the KDA kernel output + all residuals, 'wy' only its inverse/kk/scores.
