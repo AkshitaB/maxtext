@@ -1394,6 +1394,15 @@ class MoEGeneral(BaseModel):
           " segment ids."
       ),
   )
+  moe_global_load_balancing: bool = Field(
+      False,
+      description=(
+          "OLMo-core's global_load_balancing: the load-balancing loss multiplies each device's mean router"
+          " probabilities by expert counts averaged over the whole batch (all-reduced across the batch-sharding"
+          " mesh axes) instead of the device's own counts. The counts carry no gradient. The loss value is then"
+          " the global-batch one on every device."
+      ),
+  )
   moe_use_megatron_seq_aux_loss: bool = Field(
       False,
       description=(

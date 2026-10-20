@@ -313,6 +313,7 @@ emo_eval_document_expert_pool: 512
 emo_threshold_by_bisection: false
 # OLMoE3: attention/KDA mixers ignore segment ids (whole-instance, as OLMo-core); only EMo uses them.
 olmoe3_segments_for_emo_only: false
+moe_global_load_balancing: false # OLMo-core global_load_balancing: LB counts averaged over the whole batch, not per device
 moe_use_megatron_seq_aux_loss: false # when true, sigmoid routers (routed_score_func="sigmoid") use Megatron-LM's sequence-wise aux loss summed over MoE layers; false (default) uses the Switch-style loss averaged over MoE layers.
 use_random_routing: false # whether to use random routing for debug/test purpose
 use_custom_sort_vjp: true # whether to use a custom VJP sort for efficient backward pass processing in sparse matmul
