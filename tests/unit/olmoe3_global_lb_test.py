@@ -174,5 +174,49 @@ class OLMoE3GlobalLoadBalancingTest(unittest.TestCase):
     self.assertGreater(local, global_)  # fewer tokens per group: a rank is less balanced than the batch
 
 
+  def _grouped_router(self, group, sparse=True, global_lb=True):
+    router = _router(self.mesh, global_lb, sparse=sparse)
+    router.config.moe_lb_group_seqs = group
+    router._logical_to_mesh_axes = lambda names: P(("data", "expert"), None, None)  # pylint: disable=protected-access
+    router._grouped_load_balance_loss = functools.partial(  # pylint: disable=protected-access
+        olmoe3.OLMoE3LatentRoutedMoE._grouped_load_balance_loss, router  # pylint: disable=protected-access
+    )
+    return router
+
+  def test_grouped_lb_matches_reference(self):
+    """``moe_lb_group_seqs``: sharded == whole batch == a NumPy per-group reference, in value and gradient."""
+    group = 2
+    probs = np.asarray(jax.nn.softmax(self.logits, axis=-1), np.float64)
+    _, top_k = jax.lax.top_k(self.logits, TOP_K)
+    onehot = np.asarray(jax.nn.one_hot(top_k, NUM_EXPERTS), np.float64)
+    expected = 0.0
+    for g in range(BATCH // group):
+      rows = slice(g * group, (g + 1) * group)
+      tokens = group * SEQ
+      expected += (probs[rows].mean(axis=(0, 1)) * onehot[rows].sum(axis=(0, 1, 2))).sum() * NUM_EXPERTS / (TOP_K * tokens)
+    expected = 0.01 * expected / (BATCH // group)
+
+    dense = jax.value_and_grad(lambda x: _lb(self._grouped_router(group, sparse=False, global_lb=False), x))
+    ref_value, ref_grad = dense(self.logits)
+    np.testing.assert_allclose(float(ref_value), expected, rtol=1e-5)
+    router = self._grouped_router(group)
+    sharded = _with_token_axes(jax.shard_map(lambda x: _lb(router, x), mesh=self.mesh, in_specs=P(("data", "expert")),
+                                             out_specs=P(), check_vma=False))
+    value, grad = jax.jit(jax.value_and_grad(sharded))(self.logits)
+    np.testing.assert_allclose(float(value), float(ref_value), rtol=1e-5)
+    np.testing.assert_allclose(np.asarray(grad), np.asarray(ref_grad), rtol=1e-4, atol=1e-9)
+    whole_value, _ = self._whole_batch()
+    self.assertGreater(abs(float(value) - float(whole_value)), 1e-4 * abs(float(whole_value)))  # groups matter here
+
+  def test_one_group_is_the_whole_batch_loss(self):
+    router = self._grouped_router(BATCH)
+    sharded = _with_token_axes(jax.shard_map(lambda x: _lb(router, x), mesh=self.mesh, in_specs=P(("data", "expert")),
+                                             out_specs=P(), check_vma=False))
+    value, grad = jax.jit(jax.value_and_grad(sharded))(self.logits)
+    ref_value, ref_grad = self._whole_batch()
+    np.testing.assert_allclose(float(value), float(ref_value), rtol=1e-5)
+    np.testing.assert_allclose(np.asarray(grad), np.asarray(ref_grad), rtol=1e-4, atol=1e-9)
+
+
 if __name__ == "__main__":
   unittest.main()

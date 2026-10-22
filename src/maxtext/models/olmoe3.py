@@ -1346,15 +1346,18 @@ class OLMoE3LatentRoutedMoE(moe.RoutedMoE):
     variable is unset and nothing is reduced.
     """
     expert_mask = jax.nn.one_hot(top_k_indices, num_classes=self.num_experts, dtype=jnp.float32)
-    counts = expert_mask.sum(axis=(0, 1, 2))
     reduce_axes = moe.LB_REDUCE_AXES.get() if getattr(self.config, "moe_global_load_balancing", False) else None
-    if reduce_axes:
-      counts = jax.lax.pmean(jax.lax.stop_gradient(counts), reduce_axes)
-    tokens = top_k_indices.shape[0] * top_k_indices.shape[1]
-    mean_probs = logits.astype(jnp.float32).mean(axis=(0, 1))
-    lb = (mean_probs * counts).sum() * self.num_experts / (self.num_experts_per_tok * tokens)
-    if reduce_axes:
-      lb = jax.lax.pmean(lb, reduce_axes)
+    if int(getattr(self.config, "moe_lb_group_seqs", 0) or 0) > 0:
+      lb = self._grouped_load_balance_loss(expert_mask, logits, reduce_axes)
+    else:
+      counts = expert_mask.sum(axis=(0, 1, 2))
+      if reduce_axes:
+        counts = jax.lax.pmean(jax.lax.stop_gradient(counts), reduce_axes)
+      tokens = top_k_indices.shape[0] * top_k_indices.shape[1]
+      mean_probs = logits.astype(jnp.float32).mean(axis=(0, 1))
+      lb = (mean_probs * counts).sum() * self.num_experts / (self.num_experts_per_tok * tokens)
+      if reduce_axes:
+        lb = jax.lax.pmean(lb, reduce_axes)
     lb = lb * self.config.load_balance_loss_weight
     if not getattr(self.config, "olmoe3_router_metrics", False):
       return lb
@@ -1363,6 +1366,52 @@ class OLMoE3LatentRoutedMoE(moe.RoutedMoE):
     # shard_map (out_specs P(): every device computes the same values from the gathered counts).
     local_imbalance, global_imbalance = self._router_load_imbalance(expert_mask)
     return jnp.stack([lb, local_imbalance, global_imbalance])
+
+  def _grouped_load_balance_loss(self, expert_mask, probs, reduce_axes):
+    """The batch-level loss computed per group of ``moe_lb_group_seqs`` sequences and averaged over the groups.
+
+    OLMo-core computes its (global) load-balancing loss per micro-batch: the hero's are 256 sequences (4 per GPU
+    on 64 GPUs; ``global_load_balancing`` all-reduces each micro-batch's expert counts), and the 8 micro-batches'
+    losses add up. Balancing over smaller groups is a stricter constraint than over the whole batch. Groups here
+    are consecutive global batch rows (the data order is shuffled, so this matches the hero's group size, not its
+    exact membership). Per group g: ``(E / K) * sum_e mean_g(probs_e) * counts_g,e / tokens_g``, counts carrying
+    no gradient. Inside the routed MoE's shard_map each device holds some rows (and possibly part of each
+    sequence): the per-sequence counts are gathered as for the router metrics, each device sums its own tokens'
+    probabilities against its rows' group counts, and the pmean of the per-device terms, scaled by the number of
+    distinct token shards, is the global loss. ``reduce_axes`` are the token-sharding axes (``moe.LB_REDUCE_AXES``),
+    None outside the shard_map.
+    """
+    cfg = self.config
+    probs = probs.astype(jnp.float32)
+    seq_counts = jax.lax.stop_gradient(expert_mask.sum(axis=(1, 2)))  # [rows, experts]
+    seq_probs = probs.sum(axis=1)  # [rows, experts], differentiated
+    rows_local, len_local = probs.shape[0], probs.shape[1]
+    row0 = 0
+    gathered = seq_counts
+    if reduce_axes:
+      spec = self._logical_to_mesh_axes(("activation_batch", "activation_norm_length", None))
+      batch_axes = tuple(mesh_axes_for_dim(spec[0])) if spec and spec[0] is not None else ()
+      seq_axes = tuple(mesh_axes_for_dim(spec[1])) if spec and len(spec) > 1 and spec[1] is not None else ()
+      if seq_axes:
+        gathered = jax.lax.psum(gathered, seq_axes)
+      if batch_axes:
+        gathered = jax.lax.all_gather(gathered, batch_axes, axis=0, tiled=True)
+        row0 = jax.lax.axis_index(batch_axes) * rows_local
+    num_seqs = gathered.shape[0]
+    group = int(cfg.moe_lb_group_seqs)
+    if num_seqs % group:
+      group = num_seqs
+    num_groups = num_seqs // group
+    group_counts = gathered.reshape(num_groups, group, -1).sum(axis=1)  # [groups, experts]
+    tokens_per_seq = gathered.sum() / (num_seqs * self.num_experts_per_tok)
+    tokens_per_group = group * tokens_per_seq
+    row_groups = (row0 + jnp.arange(rows_local)) // group
+    term = (seq_probs * group_counts[row_groups]).sum() / (tokens_per_group * tokens_per_group)
+    lb = term * self.num_experts / (self.num_experts_per_tok * num_groups)
+    if reduce_axes:
+      token_shards = (num_seqs * tokens_per_seq) / (rows_local * len_local)
+      lb = jax.lax.pmean(lb * token_shards, reduce_axes)
+    return lb
 
   def _router_load_imbalance(self, expert_mask):
     """OLMo-core's per-layer "load imbalance" and "global load imbalance" (max / mean tokens per expert).
@@ -1418,7 +1467,8 @@ class OLMoE3LatentRoutedMoE(moe.RoutedMoE):
           kernel_axes=self.kernel_axes,
           use_bias=self.config.routed_bias,
           score_func=self.config.routed_score_func,
-          matmul_precision=self.config.matmul_precision,
+          # olmoe3_router_matmul_precision: e.g. "highest" for fp32 router logits, as OLMo-core computes them.
+          matmul_precision=getattr(self.config, "olmoe3_router_matmul_precision", "") or self.config.matmul_precision,
           shard_mode=self.config.shard_mode,
           rngs=self.rngs,
       )

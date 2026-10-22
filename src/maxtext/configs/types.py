@@ -1412,6 +1412,16 @@ class MoEGeneral(BaseModel):
           " and the micro-batch aux-loss weights use the same count. Not supported with Tunix GA."
       ),
   )
+  moe_lb_group_seqs: int = Field(
+      0,
+      description=(
+          "OLMoE3: compute the load-balancing loss per group of this many consecutive sequences and average the"
+          " groups, as OLMo-core does per micro-batch (the hero: 256). 0 = the whole batch."
+      ),
+  )
+  olmoe3_router_matmul_precision: str = Field(
+      "", description="OLMoE3: matmul precision for the router logits (e.g. 'highest'); '' uses matmul_precision."
+  )
   olmo_ppl_eval_interval: int = Field(
       0,
       description=(

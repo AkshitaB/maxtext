@@ -333,6 +333,11 @@ olmo_ppl_eval_pad_token_id: 100277
 # bf16 rounding of the logit gradients stays unbiased. Logged losses stay per trained token. Under manual gradient
 # accumulation the accumulated gradient (and the micro-batch aux-loss weights) use the same count.
 olmo_loss_denominator_counts_masked_instances: false
+# OLMoE3: compute the load-balancing loss per group of this many consecutive sequences and average the groups, as
+# OLMo-core does per micro-batch (the hero: 256 = 4 sequences on each of 64 GPUs). 0 = the whole batch.
+moe_lb_group_seqs: 0
+# OLMoE3: matmul precision for the router (gate) logits, e.g. 'highest' for fp32 like OLMo-core. '' = matmul_precision.
+olmoe3_router_matmul_precision: ''
 # Peak bf16 TFLOP/s per device for perf/mfu; 0 infers it from the device kind (v4 275, v5e 197, v5p 459, v6e 918).
 peak_device_tflops: 0.0
 moe_use_megatron_seq_aux_loss: false # when true, sigmoid routers (routed_score_func="sigmoid") use Megatron-LM's sequence-wise aux loss summed over MoE layers; false (default) uses the Switch-style loss averaged over MoE layers.
