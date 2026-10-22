@@ -1155,5 +1155,92 @@ class TestMuonLogic(unittest.TestCase):
       self.assertEqual(kernel_spec.sharding.spec, jax.sharding.PartitionSpec("data", "model"))
 
 
+class MuonOlmoCoreOptionsTest(parameterized.TestCase):
+  """muon_nesterov, muon_ns_coeffs=polar_express, and adamw_mask under Muon (OLMo-core's Muon settings)."""
+
+  def _config(self, *overrides):
+    return pyconfig.initialize(["", get_test_config_path(), "run_name=test", "opt_type=muon", *overrides])
+
+  def test_polar_express_matches_dion(self):
+    """Folding dion's 1.02 safety factor into step 1 reproduces dion's Polar Express (in fp32)."""
+
+    def dion_polar_express(g):  # dion.polar_express without its bf16 cast
+      x = g / (np.linalg.norm(g) * optimizers._POLAR_EXPRESS_SAFETY + 1e-6)  # pylint: disable=protected-access
+      for a, b, c in optimizers._POLAR_EXPRESS_COEFFS:  # pylint: disable=protected-access
+        m = x @ x.T
+        x = a * x + (b * m + c * (m @ m)) @ x
+      return x
+
+    ns_coeffs, ns_steps = optimizers.get_muon_ns_coeffs(self._config("muon_ns_coeffs=polar_express"))
+    g = np.random.default_rng(0).standard_normal((32, 64)).astype(np.float64)
+    with jax.default_matmul_precision("highest"):
+      got = optax.contrib._muon.orthogonalize_via_newton_schulz(  # pylint: disable=protected-access
+          jnp.asarray(g, jnp.float32), jnp.asarray(ns_coeffs, jnp.float32), ns_steps
+      )
+    np.testing.assert_allclose(np.asarray(got), dion_polar_express(g), atol=2e-5)
+
+  def test_standard_coeffs_unchanged(self):
+    self.assertEqual(optimizers.get_muon_ns_coeffs(self._config()), ((3.4445, -4.7750, 2.0315), 5))
+
+  def test_options_reach_optax_muon(self):
+    config = self._config("muon_nesterov=false", "muon_ns_coeffs=polar_express")
+    lr = maxtext_utils.create_learning_rate_schedule(config)
+    with (
+        patch.object(optimizers, "get_muon_weight_dimension_numbers", return_value={"w": mdn()}),
+        patch.object(optimizers, "optax_muon") as mock_muon,
+    ):
+      optimizers.get_optimizer(config, lr, model=MagicMock())
+    _, kwargs = mock_muon.call_args
+    self.assertFalse(kwargs["nesterov"])
+    self.assertEqual(kwargs["ns_steps"], 5)
+    self.assertEqual(tuple(kwargs["ns_coeffs"][1:]), optimizers._POLAR_EXPRESS_COEFFS[1:])  # pylint: disable=protected-access
+    self.assertAlmostEqual(kwargs["ns_coeffs"][0][2], 15.878769915207462 / 1.02**5)
+
+  @parameterized.parameters(True, False)
+  def test_adamw_mask_under_muon_matches_adamw(self, nesterov):
+    """With adamw_mask, the AdamW-handled parameters update exactly as optax.adamw(mask=...) and Muon's are untouched."""
+    config = self._config(
+        "adamw_mask=['embedding']", "adam_weight_decay=0.1", "muon_weight_decay=0.1", f"muon_nesterov={nesterov}"
+    )
+    lr = optax.constant_schedule(1e-2)  # the test config's schedule starts in warmup at 0
+    dim_nums = {"kernel": mdn(), "embedding": None, "scale": None}
+    rng = np.random.default_rng(0)
+    params = {
+        "kernel": jnp.asarray(rng.standard_normal((16, 8)), jnp.float32),
+        "embedding": jnp.asarray(rng.standard_normal((32, 8)), jnp.float32),
+        "scale": jnp.asarray(1 + rng.standard_normal((8,)), jnp.float32),
+    }
+    grads = [jax.tree.map(lambda x: jnp.asarray(rng.standard_normal(x.shape), jnp.float32), params) for _ in range(3)]
+
+    with patch.object(optimizers, "get_muon_weight_dimension_numbers", return_value=dim_nums):
+      opt = optimizers.get_optimizer(config, lr, model=MagicMock())
+    kw = {"b1": config.adam_b1, "b2": config.adam_b2, "eps": config.adam_eps, "eps_root": config.adam_eps_root}
+    adam_ref = optax.adamw(lr, weight_decay=0.1, mask={"embedding": False, "scale": True}, nesterov=nesterov, **kw)
+    muon_ref = optax.contrib.muon(
+        lr,
+        beta=config.muon_beta,
+        eps=config.adam_eps,
+        weight_decay=0.1,
+        nesterov=nesterov,
+        muon_weight_dimension_numbers={"kernel": mdn()},
+    )
+
+    def run(optimizer, p):
+      state = optimizer.init(p)
+      for g in grads:
+        g = {k: g[k] for k in p}
+        updates, state = optimizer.update(g, state, p)
+        p = optax.apply_updates(p, updates)
+      return p
+
+    got = run(opt, params)
+    want = run(adam_ref, {k: params[k] for k in ("embedding", "scale")}) | run(muon_ref, {"kernel": params["kernel"]})
+    for k in params:
+      np.testing.assert_allclose(got[k], want[k], rtol=1e-6, atol=1e-6, err_msg=k)
+    # The embedding is not decayed: it differs from AdamW with decay on every parameter.
+    unmasked = run(optax.adamw(lr, weight_decay=0.1, nesterov=nesterov, **kw), {"embedding": params["embedding"]})
+    self.assertGreater(float(jnp.abs(unmasked["embedding"] - got["embedding"]).max()), 1e-7)
+
+
 if __name__ == "__main__":
   absltest.main()

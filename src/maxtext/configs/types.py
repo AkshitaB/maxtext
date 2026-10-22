@@ -3476,6 +3476,20 @@ class Muon(BaseModel):
           "Whether to use all-to-all communication during Newton-Schulz" " iterations in the maxtext_muon optimizer."
       ),
   )
+  muon_nesterov: bool = Field(
+      True,
+      description=(
+          "Nesterov momentum for Muon. optax applies the same flag to Muon's AdamW branch (NAdamW when true). False"
+          " matches OLMo-core's Muon (dion): plain momentum and plain AdamW."
+      ),
+  )
+  muon_ns_coeffs: Literal["standard", "polar_express"] = Field(
+      "standard",
+      description=(
+          "Newton-Schulz coefficients. 'standard': Jordan's quintic, 5 steps (10 steps for DeepSeek4)."
+          " 'polar_express': the 5-step Polar Express schedule as dion (OLMo-core's Muon) runs it."
+      ),
+  )
 
 
 class PositionalEmbedding(BaseModel):
@@ -6539,6 +6553,7 @@ class MaxTextConfig(
         DecoderBlockType.GPT_OSS,
         DecoderBlockType.GEMMA3,
         DecoderBlockType.LLAMA2,
+        DecoderBlockType.OLMOE3,
     ]:
       raise ValueError(
           "Muon dimension numbers haven't been tested for this model. Run this command first: "
