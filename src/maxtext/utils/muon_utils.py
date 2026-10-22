@@ -57,6 +57,10 @@ EXCLUDED_SUBSTRINGS = (
     "dt_bias",
     "conv1d",
     "shared_expert_gate",
+    # OLMoE3 KDA's depthwise short convolutions: [channels, kernel_size] per-channel filters, not a linear map.
+    "q_conv",
+    "k_conv",
+    "v_conv",
 )
 
 EXCLUDED_EXACT_SEGMENTS = {

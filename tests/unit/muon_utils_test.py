@@ -67,6 +67,10 @@ class TestTransformLogic(unittest.TestCase):
   def test_logits_dense_is_excluded(self):
     self.assertIsNone(muon_utils.transform_logic(("decoder", "logits_dense", "kernel")))
 
+  def test_kda_short_conv_is_excluded(self):
+    for name in ("q_conv", "k_conv", "v_conv"):
+      self.assertIsNone(muon_utils.transform_logic(("decoder", "layers_1", "mixer", name), shape=(1024, 4)))
+
   # --- 2.1 MoE ---
   def test_moe_wi_0_uses_last_two_axes(self):
     self.assertEqual(muon_utils.transform_logic(("decoder", "MoeBlock_0", "wi_0")), mdn((-2,), (-1,)))
