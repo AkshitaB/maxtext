@@ -1299,6 +1299,7 @@ muon_consistent_rms: None # If None, apply width scaling to updates. If float, a
 muon_include_routers: true # Whether to apply Muon updates to MoE router matrices. If False, routers are optimized with AdamW.
 muon_use_all_to_all: false # Whether to use all-to-all communication during Newton-Schulz iterations in maxtext_muon.
 muon_nesterov: true # Nesterov momentum; optax applies it to Muon's AdamW branch too (NAdamW). False matches OLMo-core's Muon.
+muon_adam_nesterov: None # Nesterov for Muon's AdamW-handled parameters; None follows muon_nesterov. False (with muon_nesterov true) matches OLMo-core's OLMoDDPOptimizer Muon.
 muon_ns_coeffs: "standard" # Newton-Schulz coefficients: "standard" (Jordan's quintic) or "polar_express" (as dion / OLMo-core run it).
 
 

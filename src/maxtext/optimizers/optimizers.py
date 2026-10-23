@@ -102,6 +102,30 @@ def _adam_weight_decay_mask(muon_weight_dimension_numbers, adamw_mask_fn):
   return mask_fn
 
 
+def with_adam_nesterov(muon_opt, muon_weight_dimension_numbers, adam_nesterov: bool, **adamw_kwargs):
+  """Runs muon_opt on its Muon parameters and a separate optax.adamw(nesterov=adam_nesterov) on the rest.
+
+  optax's muon passes one nesterov flag to both its Muon and AdamW branches. OLMo-core's OLMoDDPOptimizer Muon uses
+  Nesterov momentum for Muon and plain AdamW elsewhere, which this reproduces. muon_opt still sees every parameter,
+  but its AdamW branch only gets masked leaves and holds no state.
+  """
+
+  def labels(params):
+    dim_nums = (
+        muon_weight_dimension_numbers(params)
+        if callable(muon_weight_dimension_numbers)
+        else muon_weight_dimension_numbers
+    )
+    return jax.tree.map(
+        lambda d, x: jax.tree.map(lambda _: "adam" if d is None else "muon", x),
+        dim_nums,
+        params,
+        is_leaf=_is_muon_dim_nums,
+    )
+
+  return optax.partition({"muon": muon_opt, "adam": optax.adamw(nesterov=adam_nesterov, **adamw_kwargs)}, labels)
+
+
 def add_masked_decoupled_weight_decay(
     inner_opt: optax.GradientTransformation, learning_rate, weight_decay: float, mask
 ) -> optax.GradientTransformation:
@@ -277,7 +301,7 @@ def get_optimizer(config, learning_rate_schedule, model=None, mesh=None):
     adamw_mask_fn = get_adamw_mask(config)
 
     muon_kwargs = {
-        # Shared parameters. nesterov also switches the AdamW branch to NAdamW.
+        # Shared parameters. nesterov also switches the AdamW branch to NAdamW, unless muon_adam_nesterov overrides it.
         "learning_rate": learning_rate_schedule,
         "eps": config.adam_eps,
         "mu_dtype": config.mu_dtype,
@@ -320,6 +344,20 @@ def get_optimizer(config, learning_rate_schedule, model=None, mesh=None):
     else:
       raise ValueError(
           f"Unsupported muon_type: {muon_type}. Must be 'optax_muon' (or 'optax') or 'maxtext_muon' (or 'maxtext')."
+      )
+    adam_nesterov = getattr(config, "muon_adam_nesterov", None)
+    if adam_nesterov is not None and adam_nesterov != muon_kwargs["nesterov"]:
+      base_opt = with_adam_nesterov(
+          base_opt,
+          muon_kwargs["muon_weight_dimension_numbers"],
+          adam_nesterov,
+          learning_rate=learning_rate_schedule,
+          b1=config.adam_b1,
+          b2=config.adam_b2,
+          eps=config.adam_eps,
+          eps_root=config.adam_eps_root,
+          weight_decay=muon_kwargs["adam_weight_decay"],
+          mu_dtype=config.mu_dtype,
       )
     if adamw_mask_fn is not None and config.adam_weight_decay:
       base_opt = add_masked_decoupled_weight_decay(

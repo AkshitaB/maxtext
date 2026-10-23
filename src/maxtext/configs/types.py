@@ -3483,6 +3483,13 @@ class Muon(BaseModel):
           " matches OLMo-core's Muon (dion): plain momentum and plain AdamW."
       ),
   )
+  muon_adam_nesterov: bool | None = Field(
+      None,
+      description=(
+          "Nesterov for the parameters Muon leaves to AdamW. None follows muon_nesterov (optax's behavior). True"
+          " muon_nesterov with False muon_adam_nesterov matches OLMo-core's OLMoDDPOptimizer muon_adamw."
+      ),
+  )
   muon_ns_coeffs: Literal["standard", "polar_express"] = Field(
       "standard",
       description=(

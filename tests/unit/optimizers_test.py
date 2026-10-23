@@ -1196,12 +1196,22 @@ class MuonOlmoCoreOptionsTest(parameterized.TestCase):
     self.assertEqual(tuple(kwargs["ns_coeffs"][1:]), optimizers._POLAR_EXPRESS_COEFFS[1:])  # pylint: disable=protected-access
     self.assertAlmostEqual(kwargs["ns_coeffs"][0][2], 15.878769915207462 / 1.02**5)
 
-  @parameterized.parameters(True, False)
-  def test_adamw_mask_under_muon_matches_adamw(self, nesterov):
-    """With adamw_mask, the AdamW-handled parameters update exactly as optax.adamw(mask=...) and Muon's are untouched."""
-    config = self._config(
-        "adamw_mask=['embedding']", "adam_weight_decay=0.1", "muon_weight_decay=0.1", f"muon_nesterov={nesterov}"
-    )
+  @parameterized.parameters((True, None), (False, None), (True, False), (False, True))
+  def test_adamw_mask_under_muon_matches_adamw(self, nesterov, adam_nesterov):
+    """With adamw_mask, the AdamW-handled parameters update exactly as optax.adamw(mask=...) and Muon's are untouched.
+
+    muon_adam_nesterov sets the AdamW-handled parameters' Nesterov apart from Muon's (None: the same).
+    """
+    overrides = [
+        "adamw_mask=['embedding']",
+        "adam_weight_decay=0.1",
+        "muon_weight_decay=0.1",
+        f"muon_nesterov={nesterov}",
+    ]
+    if adam_nesterov is not None:
+      overrides.append(f"muon_adam_nesterov={adam_nesterov}")
+    config = self._config(*overrides)
+    adam_nesterov = nesterov if adam_nesterov is None else adam_nesterov
     lr = optax.constant_schedule(1e-2)  # the test config's schedule starts in warmup at 0
     dim_nums = {"kernel": mdn(), "embedding": None, "scale": None}
     rng = np.random.default_rng(0)
@@ -1215,7 +1225,7 @@ class MuonOlmoCoreOptionsTest(parameterized.TestCase):
     with patch.object(optimizers, "get_muon_weight_dimension_numbers", return_value=dim_nums):
       opt = optimizers.get_optimizer(config, lr, model=MagicMock())
     kw = {"b1": config.adam_b1, "b2": config.adam_b2, "eps": config.adam_eps, "eps_root": config.adam_eps_root}
-    adam_ref = optax.adamw(lr, weight_decay=0.1, mask={"embedding": False, "scale": True}, nesterov=nesterov, **kw)
+    adam_ref = optax.adamw(lr, weight_decay=0.1, mask={"embedding": False, "scale": True}, nesterov=adam_nesterov, **kw)
     muon_ref = optax.contrib.muon(
         lr,
         beta=config.muon_beta,
@@ -1238,7 +1248,7 @@ class MuonOlmoCoreOptionsTest(parameterized.TestCase):
     for k in params:
       np.testing.assert_allclose(got[k], want[k], rtol=1e-6, atol=1e-6, err_msg=k)
     # The embedding is not decayed: it differs from AdamW with decay on every parameter.
-    unmasked = run(optax.adamw(lr, weight_decay=0.1, nesterov=nesterov, **kw), {"embedding": params["embedding"]})
+    unmasked = run(optax.adamw(lr, weight_decay=0.1, nesterov=adam_nesterov, **kw), {"embedding": params["embedding"]})
     self.assertGreater(float(jnp.abs(unmasked["embedding"] - got["embedding"]).max()), 1e-7)
 
 
