@@ -25,6 +25,7 @@ from optax.contrib._muon import muon as optax_muon
 from maxtext.common.common_types import DecoderBlockType
 from maxtext.optimizers.muon import ShardedMuonDimensionNumbers
 from maxtext.optimizers.muon import muon as maxtext_muon
+from maxtext.utils.muon_utils import ATTENTION_BLOCK_NAMES
 from maxtext.utils.muon_utils import get_muon_weight_dimension_numbers
 from maxtext.utils.maxtext_muon_utils import get_maxtext_muon_weight_dimension_numbers
 
@@ -100,6 +101,87 @@ def _adam_weight_decay_mask(muon_weight_dimension_numbers, adamw_mask_fn):
     return jax.tree.map(lambda a, k: a and k, is_adam, adamw_mask_fn(params))
 
   return mask_fn
+
+
+# Decoders whose attention query kernel is [in, (layers), heads, 2 * head_dim]: query and a sigmoid output gate fused
+# per head (attentions.py, is_qwen3_hybrid).
+_FUSED_QUERY_GATE_DECODERS = (DecoderBlockType.QWEN3_NEXT, DecoderBlockType.QWEN3_5, DecoderBlockType.OLMOE3)
+_HEADS_X_HEAD_DIM = MuonDimensionNumbers((0,), (-2, -1))
+
+
+def split_query_gate_dimension_numbers(muon_weight_dimension_numbers):
+  """Returns (dimension numbers, split mask) that orthogonalize the fused query kernel's query and gate separately.
+
+  The split leaves are viewed as [in, (layers), heads, 2, head_dim]; the 2 becomes a batch axis, so query and gate
+  are each orthogonalized as an [in, heads * head_dim] matrix, as for separate projections (OLMo-core's w_q and w_g).
+  """
+
+  def names(path):
+    return [str(getattr(k, "key", getattr(k, "name", k))) for k in path]
+
+  def is_fused_query(path, d):
+    n = names(path)
+    return (
+        d == _HEADS_X_HEAD_DIM
+        and "query" in n
+        and any(b in n for b in ATTENTION_BLOCK_NAMES)
+        and not any("vision" in part for part in n)
+    )
+
+  split = jax.tree_util.tree_map_with_path(is_fused_query, muon_weight_dimension_numbers, is_leaf=_is_muon_dim_nums)
+  dim_nums = jax.tree.map(
+      lambda d, s: MuonDimensionNumbers((0,), (-3, -1)) if s else d,
+      muon_weight_dimension_numbers,
+      split,
+      is_leaf=_is_muon_dim_nums,
+  )
+  return dim_nums, split
+
+
+def split_query_gate(inner_opt: optax.GradientTransformation, split) -> optax.GradientTransformation:
+  """Runs inner_opt with the split leaves' last axis viewed as (2, head_dim); its state keeps the parameter shapes.
+
+  Optimizer-state sharding comes from the parameters' metadata, so state leaves are reshaped back to the parameter's
+  shape between steps (matched by shape; parameters whose shapes would be ambiguous are refused).
+  """
+
+  def view_shape(shape):
+    if shape[-1] % 2:
+      raise ValueError(f"Fused query/gate kernel's last axis must be even, got {shape}")
+    return (*shape[:-1], 2, shape[-1] // 2)
+
+  def view(x):
+    return x.reshape(view_shape(x.shape))
+
+  def to_inner(tree):
+    return jax.tree.map(lambda s, x: view(x) if s else x, split, tree)
+
+  def to_outer(tree):
+    return jax.tree.map(lambda s, x: x.reshape(*x.shape[:-2], -1) if s else x, split, tree)
+
+  def shape_maps(params):
+    split_shapes, other_shapes = set(), set()
+    jax.tree.map(lambda s, x: (split_shapes if s else other_shapes).add(tuple(x.shape)), split, params)
+    inner = {shape: view_shape(shape) for shape in split_shapes}
+    if other_shapes & (split_shapes | set(inner.values())):
+      raise ValueError("muon_split_query_gate: another parameter has a fused query kernel's shape")
+    return inner, {v: k for k, v in inner.items()}
+
+  def convert_state(state, mapping):
+    return jax.tree.map(lambda x: x.reshape(mapping[x.shape]) if getattr(x, "shape", None) in mapping else x, state)
+
+  def init_fn(params):
+    _, outer = shape_maps(params)
+    return convert_state(inner_opt.init(to_inner(params)), outer)
+
+  def update_fn(updates, state, params=None):
+    if params is None:
+      raise ValueError("muon_split_query_gate needs params.")
+    inner, outer = shape_maps(params)
+    inner_updates, inner_state = inner_opt.update(to_inner(updates), convert_state(state, inner), to_inner(params))
+    return to_outer(inner_updates), convert_state(inner_state, outer)
+
+  return optax.GradientTransformation(init_fn, update_fn)
 
 
 def with_adam_nesterov(muon_opt, muon_weight_dimension_numbers, adam_nesterov: bool, **adamw_kwargs):
@@ -319,6 +401,7 @@ def get_optimizer(config, learning_rate_schedule, model=None, mesh=None):
         "adam_weight_decay": 0.0 if adamw_mask_fn is not None else config.adam_weight_decay,
     }
 
+    query_gate_split = None
     if muon_type in ("optax", "optax_muon"):
       assert not getattr(
           config, "muon_use_all_to_all", False
@@ -327,9 +410,17 @@ def get_optimizer(config, learning_rate_schedule, model=None, mesh=None):
         muon_weight_dimension_numbers = get_muon_weight_dimension_numbers(model, config)
       else:
         raise ValueError("Please specify model to extract muon dimension number.")
+      if getattr(config, "muon_split_query_gate", False):
+        if config.decoder_block not in _FUSED_QUERY_GATE_DECODERS:
+          raise ValueError(f"muon_split_query_gate: {config.decoder_block} has no fused query/gate projection.")
+        muon_weight_dimension_numbers, query_gate_split = split_query_gate_dimension_numbers(
+            muon_weight_dimension_numbers
+        )
       muon_kwargs = muon_kwargs | {"muon_weight_dimension_numbers": muon_weight_dimension_numbers}
       base_opt = optax_muon(**muon_kwargs)  # pyrefly: ignore[bad-argument-type]
     elif muon_type in ("maxtext", "maxtext_muon"):
+      if getattr(config, "muon_split_query_gate", False):
+        raise NotImplementedError("muon_split_query_gate is only implemented for optax_muon.")
       if model is not None:
         muon_weight_dimension_numbers = get_maxtext_muon_weight_dimension_numbers(model, config, mesh=mesh)
       else:
@@ -359,6 +450,8 @@ def get_optimizer(config, learning_rate_schedule, model=None, mesh=None):
           weight_decay=muon_kwargs["adam_weight_decay"],
           mu_dtype=config.mu_dtype,
       )
+    if query_gate_split is not None:
+      base_opt = split_query_gate(base_opt, query_gate_split)
     if adamw_mask_fn is not None and config.adam_weight_decay:
       base_opt = add_masked_decoupled_weight_decay(
           base_opt,

@@ -1252,5 +1252,97 @@ class MuonOlmoCoreOptionsTest(parameterized.TestCase):
     self.assertGreater(float(jnp.abs(unmasked["embedding"] - got["embedding"]).max()), 1e-7)
 
 
+  @parameterized.parameters(None, False)
+  def test_split_query_gate_matches_separate_projections(self, adam_nesterov):
+    """muon_split_query_gate: the fused query kernel updates as Muon on separate query and gate kernels would."""
+    overrides = [
+        "decoder_block=olmoe3",
+        "muon_split_query_gate=true",
+        "muon_consistent_rms=0.2",
+        "muon_weight_decay=0.1",
+        "adamw_mask=['embedding']",
+        "adam_weight_decay=0.1",
+    ]
+    if adam_nesterov is not None:
+      overrides.append(f"muon_adam_nesterov={adam_nesterov}")
+    config = self._config(*overrides)
+    lr = optax.constant_schedule(1e-2)
+    rng = np.random.default_rng(0)
+    heads, head_dim = 2, 4
+
+    def rand(*shape):
+      return jnp.asarray(rng.standard_normal(shape), jnp.float32)
+
+    attention = {"query": {"kernel": rand(16, heads, 2 * head_dim)}, "key": {"kernel": rand(16, heads, head_dim)}}
+    params = {
+        "decoder": {"layers_7": {"mixer": {"attention": attention}}, "layers_7_norm": {"scale": rand(16)}},
+        "token_embedder": {"embedding": rand(32, 16)},
+    }
+    dim_nums = muon_utils.get_transform_tree(params)
+    grads = [jax.tree.map(lambda x: rand(*x.shape), params) for _ in range(3)]
+
+    def run(optimizer, p, g_fn):
+      # The state keeps parameter shapes (its sharding comes from the parameters): no leaf in the split view.
+      def check(state):
+        self.assertNotIn((16, heads, 2, head_dim), [x.shape for x in jax.tree.leaves(state)])
+
+      state = optimizer.init(p)
+      check(state)
+      for g in grads:
+        updates, state = optimizer.update(g_fn(g), state, p)
+        p = optax.apply_updates(p, updates)
+        check(state)
+      return p
+
+    with patch.object(optimizers, "get_muon_weight_dimension_numbers", return_value=dim_nums):
+      got = run(optimizers.get_optimizer(config, lr, model=MagicMock()), params, lambda g: g)
+
+    # Reference: optax's muon with query and gate as separate [in, heads, head_dim] kernels.
+    def split(tree):
+      q, g = jnp.split(tree["decoder"]["layers_7"]["mixer"]["attention"]["query"]["kernel"], 2, axis=-1)
+      return {"q": q, "g": g, "key": tree["decoder"]["layers_7"]["mixer"]["attention"]["key"]["kernel"]}
+
+    muon_ref = optax.contrib.muon(
+        lr,
+        beta=config.muon_beta,
+        eps=config.adam_eps,
+        weight_decay=0.1,
+        consistent_rms=0.2,
+        muon_weight_dimension_numbers={k: mdn((0,), (-2, -1)) for k in ("q", "g", "key")},
+    )
+    want = run(muon_ref, split(params), split)
+    np.testing.assert_allclose(
+        got["decoder"]["layers_7"]["mixer"]["attention"]["query"]["kernel"],
+        jnp.concatenate([want["q"], want["g"]], axis=-1),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        got["decoder"]["layers_7"]["mixer"]["attention"]["key"]["kernel"], want["key"], rtol=1e-6, atol=1e-6
+    )
+    # Without the flag, query and gate are orthogonalized together and the result differs.
+    with patch.object(optimizers, "get_muon_weight_dimension_numbers", return_value=dim_nums):
+      fused = run(
+          optimizers.get_optimizer(self._config(*overrides[:1], *overrides[2:]), lr, model=MagicMock()),
+          params,
+          lambda g: g,
+      )
+    self.assertGreater(
+        float(
+            jnp.abs(
+                fused["decoder"]["layers_7"]["mixer"]["attention"]["query"]["kernel"]
+                - got["decoder"]["layers_7"]["mixer"]["attention"]["query"]["kernel"]
+            ).max()
+        ),
+        1e-4,
+    )
+
+  def test_split_query_gate_rejects_other_decoders(self):
+    with patch.object(optimizers, "get_muon_weight_dimension_numbers", return_value={}):
+      with self.assertRaisesRegex(ValueError, "no fused query/gate"):
+        optimizers.get_optimizer(
+            self._config("muon_split_query_gate=true"), optax.constant_schedule(1e-2), model=MagicMock()
+        )
+
 if __name__ == "__main__":
   absltest.main()

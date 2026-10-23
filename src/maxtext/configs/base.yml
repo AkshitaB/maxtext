@@ -1300,6 +1300,7 @@ muon_include_routers: true # Whether to apply Muon updates to MoE router matrice
 muon_use_all_to_all: false # Whether to use all-to-all communication during Newton-Schulz iterations in maxtext_muon.
 muon_nesterov: true # Nesterov momentum; optax applies it to Muon's AdamW branch too (NAdamW). False matches OLMo-core's Muon.
 muon_adam_nesterov: None # Nesterov for Muon's AdamW-handled parameters; None follows muon_nesterov. False (with muon_nesterov true) matches OLMo-core's OLMoDDPOptimizer Muon.
+muon_split_query_gate: false # Orthogonalize the fused query kernel's query and gate halves separately (Qwen3-Next, Qwen3.5, OLMoE3; optax_muon). True matches OLMo-core's separate w_q / w_g.
 muon_ns_coeffs: "standard" # Newton-Schulz coefficients: "standard" (Jordan's quintic) or "polar_express" (as dion / OLMo-core run it).
 
 

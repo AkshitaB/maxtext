@@ -3490,6 +3490,13 @@ class Muon(BaseModel):
           " muon_nesterov with False muon_adam_nesterov matches OLMo-core's OLMoDDPOptimizer muon_adamw."
       ),
   )
+  muon_split_query_gate: bool = Field(
+      False,
+      description=(
+          "Orthogonalize the fused attention query kernel's query and output-gate halves as separate matrices"
+          " (Qwen3-Next, Qwen3.5, OLMoE3), as for separate projections (OLMo-core's w_q and w_g). optax_muon only."
+      ),
+  )
   muon_ns_coeffs: Literal["standard", "polar_express"] = Field(
       "standard",
       description=(
