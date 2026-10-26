@@ -3470,6 +3470,13 @@ class Muon(BaseModel):
           "Whether to apply Muon updates to MoE router matrices. If False," " routers are optimized with AdamW."
       ),
   )
+  muon_adamw_params: list[str] = Field(
+      default_factory=list,
+      description=(
+          "Regexes searched in the '/'-joined parameter path (as adamw_mask): matching parameters that Muon would"
+          " orthogonalize are updated by Muon's AdamW branch instead."
+      ),
+  )
   muon_use_all_to_all: bool = Field(
       False,
       description=(

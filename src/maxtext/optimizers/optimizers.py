@@ -25,6 +25,7 @@ from optax.contrib._muon import muon as optax_muon
 from maxtext.common.common_types import DecoderBlockType
 from maxtext.optimizers.muon import ShardedMuonDimensionNumbers
 from maxtext.optimizers.muon import muon as maxtext_muon
+from maxtext.utils import max_logging
 from maxtext.utils.muon_utils import ATTENTION_BLOCK_NAMES
 from maxtext.utils.muon_utils import get_muon_weight_dimension_numbers
 from maxtext.utils.maxtext_muon_utils import get_maxtext_muon_weight_dimension_numbers
@@ -101,6 +102,30 @@ def _adam_weight_decay_mask(muon_weight_dimension_numbers, adamw_mask_fn):
     return jax.tree.map(lambda a, k: a and k, is_adam, adamw_mask_fn(params))
 
   return mask_fn
+
+
+def move_to_adamw(muon_weight_dimension_numbers, patterns):
+  """Sets the dimension numbers of the parameters whose path matches any of patterns to None (AdamW instead of Muon).
+
+  Paths are joined with '/' as for adamw_mask, e.g. "decoder/layer_7/mixer/attention/query/kernel".
+  """
+  if not patterns:
+    return muon_weight_dimension_numbers
+  compiled = [re.compile(p) for p in patterns]
+  moved = []
+
+  def move(path, d):
+    path_str = jax.tree_util.keystr(path, simple=True, separator="/")
+    if d is not None and any(p.search(path_str) for p in compiled):
+      moved.append(path_str)
+      return None
+    return d
+
+  dim_nums = jax.tree_util.tree_map_with_path(move, muon_weight_dimension_numbers, is_leaf=_is_muon_dim_nums)
+  if not moved:
+    raise ValueError(f"muon_adamw_params {patterns} matched no parameter that Muon updates.")
+  max_logging.log(f"muon_adamw_params: {len(moved)} parameters moved from Muon to AdamW: {moved}")
+  return dim_nums
 
 
 # Decoders whose attention query kernel is [in, (layers), heads, 2 * head_dim]: query and a sigmoid output gate fused
@@ -410,6 +435,9 @@ def get_optimizer(config, learning_rate_schedule, model=None, mesh=None):
         muon_weight_dimension_numbers = get_muon_weight_dimension_numbers(model, config)
       else:
         raise ValueError("Please specify model to extract muon dimension number.")
+      muon_weight_dimension_numbers = move_to_adamw(
+          muon_weight_dimension_numbers, getattr(config, "muon_adamw_params", None)
+      )
       if getattr(config, "muon_split_query_gate", False):
         if config.decoder_block not in _FUSED_QUERY_GATE_DECODERS:
           raise ValueError(f"muon_split_query_gate: {config.decoder_block} has no fused query/gate projection.")
@@ -425,6 +453,9 @@ def get_optimizer(config, learning_rate_schedule, model=None, mesh=None):
         muon_weight_dimension_numbers = get_maxtext_muon_weight_dimension_numbers(model, config, mesh=mesh)
       else:
         raise ValueError("Please specify model to extract muon dimension number.")
+      muon_weight_dimension_numbers = move_to_adamw(
+          muon_weight_dimension_numbers, getattr(config, "muon_adamw_params", None)
+      )
 
       use_all_to_all = getattr(config, "muon_use_all_to_all", True)
       muon_kwargs = muon_kwargs | {
