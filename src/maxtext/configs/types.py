@@ -3477,6 +3477,13 @@ class Muon(BaseModel):
           " orthogonalize are updated by Muon's AdamW branch instead."
       ),
   )
+  muon_per_head: bool = Field(
+      False,
+      description=(
+          "Orthogonalize OLMoE3's attention q/k/v/out and KDA w_q/w_k/w_v/w_out one head at a time (heads as a batch"
+          " axis) instead of across all heads (optax_muon, scan_layers=False)."
+      ),
+  )
   lr_multipliers: list[str] = Field(
       default_factory=list,
       description=(

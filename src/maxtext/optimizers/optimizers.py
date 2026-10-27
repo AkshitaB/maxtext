@@ -209,6 +209,125 @@ def split_query_gate(inner_opt: optax.GradientTransformation, split) -> optax.Gr
   return optax.GradientTransformation(init_fn, update_fn)
 
 
+class HeadView:
+  """Per-head view of a flattened 2D kernel: side "in" splits axis 0 into (heads, rest), "out" splits axis 1."""
+
+  def __init__(self, side: str, heads: int):
+    self.side, self.heads = side, heads
+
+  def shape(self, shape):
+    if len(shape) != 2:
+      raise ValueError(f"muon_per_head views 2D kernels (scan_layers=False), got {shape}")
+    axis = 0 if self.side == "in" else 1
+    if shape[axis] % self.heads:
+      raise ValueError(f"muon_per_head: axis {axis} of {shape} doesn't split into {self.heads} heads")
+    if self.side == "in":
+      return (self.heads, shape[0] // self.heads, shape[1])
+    return (shape[0], self.heads, shape[1] // self.heads)
+
+
+def _path_names(path):
+  return [str(getattr(k, "key", getattr(k, "name", k))) for k in path]
+
+
+def per_head_dimension_numbers(muon_weight_dimension_numbers, config):
+  """Returns (dimension numbers, views) that orthogonalize OLMoE3's attention and KDA projections one head at a time.
+
+  Heads become a batch axis, so no update mixes heads. Attention q/k/v ([in, heads, head_dim], or the split query/gate
+  view [in, heads, 2, head_dim]) only change dimension numbers. Kernels that flatten heads into one axis are viewed
+  per head (views[leaf] is a HeadView): attention out [heads * head_dim, out] and KDA w_out [heads * dv, out] as
+  [heads, head_dim, out]; KDA w_q / w_k / w_v [in, heads * d] as [in, heads, d]. Other leaves are unchanged (False).
+  """
+  kda_heads, attn_heads = config.gdn_num_value_heads, config.num_query_heads
+  per_head_qkv = MuonDimensionNumbers((0,), (-1,))
+  per_head_out = MuonDimensionNumbers((-2,), (-1,))
+  flat = MuonDimensionNumbers((0,), (-1,))
+  changed = []
+
+  def assign(path, d):
+    if d is None:
+      return d, False
+    n = _path_names(path)
+    name = n[-2] if len(n) > 1 else ""
+    if any(b in n for b in ATTENTION_BLOCK_NAMES):
+      if d in (_HEADS_X_HEAD_DIM, MuonDimensionNumbers((0,), (-3, -1))):
+        changed.append("/".join(n))
+        return per_head_qkv, False
+      if name == "out" and d == flat:
+        changed.append("/".join(n))
+        return per_head_out, HeadView("in", attn_heads)
+      if d == MuonDimensionNumbers((0, -2), (-1,)):
+        changed.append("/".join(n))
+        return per_head_out, False
+      return d, False
+    if "mixer" in n and d == flat and name in ("w_q", "w_k", "w_v", "w_out"):
+      changed.append("/".join(n))
+      return (per_head_out, HeadView("in", kda_heads)) if name == "w_out" else (per_head_qkv, HeadView("out", kda_heads))
+    return d, False
+
+  pairs = jax.tree_util.tree_map_with_path(assign, muon_weight_dimension_numbers, is_leaf=_is_muon_dim_nums)
+  is_pair = lambda x: isinstance(x, tuple) and len(x) == 2 and not _is_muon_dim_nums(x)  # pylint: disable=unnecessary-lambda-assignment
+  dim_nums = jax.tree.map(lambda p: p[0], pairs, is_leaf=is_pair)
+  views = jax.tree.map(lambda p: p[1], pairs, is_leaf=is_pair)
+  if not changed:
+    raise ValueError("muon_per_head matched no attention or KDA projection.")
+  max_logging.log(f"muon_per_head: {len(changed)} kernels orthogonalized per head: {changed}")
+  return dim_nums, views
+
+
+def view_per_head(inner_opt: optax.GradientTransformation, views) -> optax.GradientTransformation:
+  """Runs inner_opt with the HeadView leaves reshaped per head; its state keeps the parameter shapes.
+
+  State leaves are matched to parameters by path (a state leaf's path ends with its parameter's path), since
+  differently viewed kernels can share a shape (KDA w_q and attention out are both [1024, 1024] here).
+  """
+  is_view = lambda v: isinstance(v, HeadView)  # pylint: disable=unnecessary-lambda-assignment
+
+  def to_inner(tree):
+    return jax.tree.map(lambda v, x: x.reshape(v.shape(x.shape)) if is_view(v) else x, views, tree, is_leaf=is_view)
+
+  def to_outer(tree, params):
+    return jax.tree.map(lambda v, x, p: x.reshape(p.shape) if is_view(v) else x, views, tree, params, is_leaf=is_view)
+
+  def table(params, inward):
+    out = {}
+
+    def add(path, v, x):
+      if is_view(v):
+        outer, inner = tuple(x.shape), v.shape(x.shape)
+        out[tuple(_path_names(path))] = (outer, inner) if inward else (inner, outer)
+
+    jax.tree_util.tree_map_with_path(add, views, params, is_leaf=is_view)
+    return out
+
+  def convert_state(state, mapping):
+    def conv(path, x):
+      shape = getattr(x, "shape", None)
+      if shape is None:
+        return x
+      n = tuple(_path_names(path))
+      for i in range(len(n)):
+        hit = mapping.get(n[i:])
+        if hit is not None and tuple(shape) == hit[0]:
+          return x.reshape(hit[1])
+      return x
+
+    return jax.tree_util.tree_map_with_path(conv, state)
+
+  def init_fn(params):
+    return convert_state(inner_opt.init(to_inner(params)), table(params, inward=False))
+
+  def update_fn(updates, state, params=None):
+    if params is None:
+      raise ValueError("muon_per_head needs params.")
+    inner_updates, inner_state = inner_opt.update(
+        to_inner(updates), convert_state(state, table(params, inward=True)), to_inner(params)
+    )
+    return to_outer(inner_updates, params), convert_state(inner_state, table(params, inward=False))
+
+  return optax.GradientTransformation(init_fn, update_fn)
+
+
 def with_adam_nesterov(muon_opt, muon_weight_dimension_numbers, adam_nesterov: bool, **adamw_kwargs):
   """Runs muon_opt on its Muon parameters and a separate optax.adamw(nesterov=adam_nesterov) on the rest.
 
@@ -484,6 +603,7 @@ def get_optimizer(config, learning_rate_schedule, model=None, mesh=None):
     }
 
     query_gate_split = None
+    head_views = None
     if muon_type in ("optax", "optax_muon"):
       assert not getattr(
           config, "muon_use_all_to_all", False
@@ -501,11 +621,17 @@ def get_optimizer(config, learning_rate_schedule, model=None, mesh=None):
         muon_weight_dimension_numbers, query_gate_split = split_query_gate_dimension_numbers(
             muon_weight_dimension_numbers
         )
+      if getattr(config, "muon_per_head", False):
+        if config.decoder_block != DecoderBlockType.OLMOE3 or config.scan_layers:
+          raise NotImplementedError("muon_per_head is only implemented for OLMoE3 with scan_layers=False.")
+        muon_weight_dimension_numbers, head_views = per_head_dimension_numbers(muon_weight_dimension_numbers, config)
       muon_kwargs = muon_kwargs | {"muon_weight_dimension_numbers": muon_weight_dimension_numbers}
       base_opt = optax_muon(**muon_kwargs)  # pyrefly: ignore[bad-argument-type]
     elif muon_type in ("maxtext", "maxtext_muon"):
       if getattr(config, "muon_split_query_gate", False):
         raise NotImplementedError("muon_split_query_gate is only implemented for optax_muon.")
+      if getattr(config, "muon_per_head", False):
+        raise NotImplementedError("muon_per_head is only implemented for optax_muon.")
       if model is not None:
         muon_weight_dimension_numbers = get_maxtext_muon_weight_dimension_numbers(model, config, mesh=mesh)
       else:
@@ -538,6 +664,9 @@ def get_optimizer(config, learning_rate_schedule, model=None, mesh=None):
           weight_decay=muon_kwargs["adam_weight_decay"],
           mu_dtype=config.mu_dtype,
       )
+    if head_views is not None:
+      # Inside split_query_gate, which checks parameter shapes before any per-head view.
+      base_opt = view_per_head(base_opt, head_views)
     if query_gate_split is not None:
       base_opt = split_query_gate(base_opt, query_gate_split)
     if adamw_mask_fn is not None and config.adam_weight_decay:
