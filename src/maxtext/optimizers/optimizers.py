@@ -257,6 +257,63 @@ def add_masked_decoupled_weight_decay(
   return optax.GradientTransformation(init_fn, update_fn)
 
 
+ADAMW_BRANCH = "@adamw"
+
+
+def scale_lr_by_path(rules, muon_weight_dimension_numbers=None) -> optax.GradientTransformation:
+  """Multiplies the final updates of the parameters matching each rule, which scales their learning rate.
+
+  rules are "regex=multiplier" strings, searched in the '/'-joined parameter path as for adamw_mask; the first match
+  wins. The pattern "@adamw" matches every parameter on Muon's AdamW branch. Adam's update and its decoupled weight
+  decay are both linear in the learning rate, so a multiplier m on the full update is exactly a learning rate of m * lr
+  for those parameters. This must wrap the whole optimizer, decay terms included.
+  """
+  parsed = []
+  for rule in rules:
+    pattern, _, mult = rule.rpartition("=")
+    if not pattern:
+      raise ValueError(f"lr_multipliers entry {rule!r} is not 'regex=multiplier'.")
+    parsed.append((pattern, None if pattern == ADAMW_BRANCH else re.compile(pattern), float(mult)))
+  if any(c is None for _, c, _ in parsed) and muon_weight_dimension_numbers is None:
+    raise ValueError(f"lr_multipliers pattern {ADAMW_BRANCH!r} needs opt_type=muon.")
+
+  def multipliers(updates):
+    is_adam = None
+    if muon_weight_dimension_numbers is not None:
+      is_adam = _adam_weight_decay_mask(muon_weight_dimension_numbers, lambda t: jax.tree.map(lambda _: True, t))(
+          updates
+      )
+    counts = {pattern: 0 for pattern, _, _ in parsed}
+
+    def mult(path, _, adam):
+      path_str = jax.tree_util.keystr(path, simple=True, separator="/")
+      for pattern, compiled, m in parsed:
+        if (adam if compiled is None else compiled.search(path_str)):
+          counts[pattern] += 1
+          return m
+      return 1.0
+
+    if is_adam is None:
+      is_adam = jax.tree.map(lambda _: False, updates)
+    mults = jax.tree_util.tree_map_with_path(mult, updates, is_adam)
+    unmatched = [pattern for pattern, n in counts.items() if not n]
+    if unmatched:
+      raise ValueError(f"lr_multipliers patterns {unmatched} matched no parameter.")
+    max_logging.log(f"lr_multipliers: parameters per rule {counts}")
+    return mults
+
+  def init_fn(params):
+    del params
+    return optax.EmptyState()
+
+  def update_fn(updates, state, params=None):
+    del params
+    mults = multipliers(updates)
+    return jax.tree.map(lambda u, m: u if m == 1.0 else u * jnp.asarray(m, u.dtype), updates, mults), state
+
+  return optax.GradientTransformation(init_fn, update_fn)
+
+
 def _compute_rolling_stats(arr: jax.Array, count: jax.Array, interval: int):
   """Computes mean and unbiased std (Bessel's correction) over a rolling window."""
   valid_elements = jnp.minimum(count, interval)
@@ -492,6 +549,13 @@ def get_optimizer(config, learning_rate_schedule, model=None, mesh=None):
       )
   else:
     raise ValueError(f"{config.opt_type=} is not a supported.")
+
+  lr_multipliers = getattr(config, "lr_multipliers", None)
+  if lr_multipliers:
+    base_opt = optax.chain(
+        base_opt,
+        scale_lr_by_path(lr_multipliers, muon_kwargs["muon_weight_dimension_numbers"] if config.opt_type == "muon" else None),
+    )
 
   if getattr(config, "skip_step_on_spikes", False):
     base_opt = skip_step_on_spikes(

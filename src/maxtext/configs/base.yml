@@ -1298,6 +1298,7 @@ muon_weight_decay: 0 # Strength of the weight decay regularization. This is mult
 muon_consistent_rms: None # If None, apply width scaling to updates. If float, apply consistent rms scaling (recommend 0.2).
 muon_include_routers: true # Whether to apply Muon updates to MoE router matrices. If False, routers are optimized with AdamW.
 muon_adamw_params: [] # Regexes (searched in the '/'-joined parameter path, like adamw_mask) of parameters Muon would orthogonalize that AdamW updates instead, e.g. ['mixer/attention/'].
+lr_multipliers: [] # 'regex=multiplier' entries (first match wins) scaling the learning rate of matching parameters, decay included; '@adamw=0.25' scales all of Muon's AdamW branch.
 muon_use_all_to_all: false # Whether to use all-to-all communication during Newton-Schulz iterations in maxtext_muon.
 muon_nesterov: true # Nesterov momentum; optax applies it to Muon's AdamW branch too (NAdamW). False matches OLMo-core's Muon.
 muon_adam_nesterov: None # Nesterov for Muon's AdamW-handled parameters; None follows muon_nesterov. False (with muon_nesterov true) matches OLMo-core's OLMoDDPOptimizer Muon.

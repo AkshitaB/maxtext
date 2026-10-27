@@ -3477,6 +3477,13 @@ class Muon(BaseModel):
           " orthogonalize are updated by Muon's AdamW branch instead."
       ),
   )
+  lr_multipliers: list[str] = Field(
+      default_factory=list,
+      description=(
+          "'regex=multiplier' entries: the updates of parameters whose '/'-joined path matches (first match wins) are"
+          " multiplied, i.e. their learning rate is scaled. '@adamw=m' matches all of Muon's AdamW-branch parameters."
+      ),
+  )
   muon_use_all_to_all: bool = Field(
       False,
       description=(
