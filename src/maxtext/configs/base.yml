@@ -1299,6 +1299,7 @@ muon_consistent_rms: None # If None, apply width scaling to updates. If float, a
 muon_include_routers: true # Whether to apply Muon updates to MoE router matrices. If False, routers are optimized with AdamW.
 muon_adamw_params: [] # Regexes (searched in the '/'-joined parameter path, like adamw_mask) of parameters Muon would orthogonalize that AdamW updates instead, e.g. ['mixer/attention/'].
 muon_per_head: false # Orthogonalize OLMoE3's attention q/k/v/out and KDA w_q/w_k/w_v/w_out per head (heads as a batch axis) instead of across heads.
+muon_per_head_gates: false # With muon_per_head, also KDA's f_proj_2 and g_proj_2 (gate outputs reshaped per head).
 lr_multipliers: [] # 'regex=multiplier' entries (first match wins) scaling the learning rate of matching parameters, decay included; '@adamw=0.25' scales all of Muon's AdamW branch.
 muon_use_all_to_all: false # Whether to use all-to-all communication during Newton-Schulz iterations in maxtext_muon.
 muon_nesterov: true # Nesterov momentum; optax applies it to Muon's AdamW branch too (NAdamW). False matches OLMo-core's Muon.

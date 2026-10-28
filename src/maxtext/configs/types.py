@@ -3484,6 +3484,13 @@ class Muon(BaseModel):
           " axis) instead of across all heads (optax_muon, scan_layers=False)."
       ),
   )
+  muon_per_head_gates: bool = Field(
+      False,
+      description=(
+          "With muon_per_head, also orthogonalize KDA's f_proj_2 and g_proj_2 per head: their outputs are reshaped"
+          " into [heads, head_dim] (forget and output gates), like w_q/w_k/w_v."
+      ),
+  )
   lr_multipliers: list[str] = Field(
       default_factory=list,
       description=(

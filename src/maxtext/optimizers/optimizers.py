@@ -236,9 +236,15 @@ def per_head_dimension_numbers(muon_weight_dimension_numbers, config):
   Heads become a batch axis, so no update mixes heads. Attention q/k/v ([in, heads, head_dim], or the split query/gate
   view [in, heads, 2, head_dim]) only change dimension numbers. Kernels that flatten heads into one axis are viewed
   per head (views[leaf] is a HeadView): attention out [heads * head_dim, out] and KDA w_out [heads * dv, out] as
-  [heads, head_dim, out]; KDA w_q / w_k / w_v [in, heads * d] as [in, heads, d]. Other leaves are unchanged (False).
+  [heads, head_dim, out]; KDA w_q / w_k / w_v [in, heads * d] as [in, heads, d]. With muon_per_head_gates, also the
+  second halves of KDA's low-rank gates, f_proj_2 [dv, heads * dk] (forget gate) and g_proj_2 [dv, heads * dv] (output
+  gate), whose outputs are reshaped per head like w_q / w_k / w_v; their first halves map into one bottleneck shared by
+  every head, so they stay joint. Other leaves are unchanged (False).
   """
   kda_heads, attn_heads = config.gdn_num_value_heads, config.num_query_heads
+  kda_out_heads = ("w_q", "w_k", "w_v")
+  if getattr(config, "muon_per_head_gates", False):
+    kda_out_heads += ("f_proj_2", "g_proj_2")
   per_head_qkv = MuonDimensionNumbers((0,), (-1,))
   per_head_out = MuonDimensionNumbers((-2,), (-1,))
   flat = MuonDimensionNumbers((0,), (-1,))
@@ -260,7 +266,7 @@ def per_head_dimension_numbers(muon_weight_dimension_numbers, config):
         changed.append("/".join(n))
         return per_head_out, False
       return d, False
-    if "mixer" in n and d == flat and name in ("w_q", "w_k", "w_v", "w_out"):
+    if "mixer" in n and d == flat and name in kda_out_heads + ("w_out",):
       changed.append("/".join(n))
       return (per_head_out, HeadView("in", kda_heads)) if name == "w_out" else (per_head_qkv, HeadView("out", kda_heads))
     return d, False
