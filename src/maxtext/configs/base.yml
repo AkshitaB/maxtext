@@ -1693,6 +1693,9 @@ olmoe3_replicate_router: false
 kda_fused_proj_reduce_scatter: false
 # Fuse the KDA layer's six input projections of x into one matmul (same params).
 kda_fused_input_proj: false
+# KDA's output gate as one full-rank emb -> heads * head_v_dim projection (g_proj), instead of low rank through
+# head_v_dim (g_proj_1, g_proj_2). Full attention's gate is full rank either way.
+kda_full_rank_output_gate: false
 # Fused tokamax Kimi Delta Attention kernel (experimental; Pallas Mosaic on TPU >= gen6).
 use_tokamax_kda: false
 # Reference beta in [0, 2) via allow_neg_eigval; False clamps to [0, 1] (diagnostic).

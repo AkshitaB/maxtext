@@ -1971,6 +1971,13 @@ class Qwen3Next(BaseModel):
           " matmul over their concatenated kernels. Same parameters and math; fewer, wider matmuls."
       ),
   )
+  kda_full_rank_output_gate: bool = Field(
+      False,
+      description=(
+          "KDA's output gate as one full-rank emb -> heads * head_v_dim projection (g_proj, with bias) instead of"
+          " the low-rank g_proj_1 (emb -> head_v_dim) and g_proj_2 (head_v_dim -> heads * head_v_dim)."
+      ),
+  )
   kda_chunked_impl: Literal["pairwise", "subblock"] = Field(
       "pairwise",
       description=(

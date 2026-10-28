@@ -200,9 +200,14 @@ class OLMoE3KimiDeltaAttention(nnx.Module):
     self.A_log = nnx.Param(jnp.log(1.0 + a_log_init(rngs.params(), (self.num_heads,), jnp.float32)))
     self.dt_bias = nnx.Param(jnp.zeros((key_width,), jnp.float32))
 
-    # Low-rank output gate: emb -> head_v_dim -> value_width (this one has a bias).
-    self.g_proj_1 = _dense(cfg, cfg.emb_dim, self.head_v_dim, ("embed", "mlp"), quant, rngs, mesh=mesh)
-    self.g_proj_2 = _dense(cfg, self.head_v_dim, value_width, ("mlp", "embed"), quant, rngs, use_bias=True, mesh=mesh)
+    # Output gate: low rank, emb -> head_v_dim -> value_width (this one has a bias), or with
+    # kda_full_rank_output_gate one emb -> value_width projection, as full attention's gate.
+    self.full_rank_output_gate = bool(cfg.kda_full_rank_output_gate)
+    if self.full_rank_output_gate:
+      self.g_proj = _dense(cfg, cfg.emb_dim, value_width, ("embed", "mlp"), quant, rngs, use_bias=True, mesh=mesh)
+    else:
+      self.g_proj_1 = _dense(cfg, cfg.emb_dim, self.head_v_dim, ("embed", "mlp"), quant, rngs, mesh=mesh)
+      self.g_proj_2 = _dense(cfg, self.head_v_dim, value_width, ("mlp", "embed"), quant, rngs, use_bias=True, mesh=mesh)
 
     self.o_norm = RMSNorm(
         num_features=self.head_v_dim,
@@ -227,7 +232,8 @@ class OLMoE3KimiDeltaAttention(nnx.Module):
       q_in, k_in, v_in, f_in, g_in, b_in = self._fused_input_proj(x)
     else:
       q_in, k_in, v_in = self.w_q(x), self.w_k(x), self.w_v(x)
-      f_in, g_in, b_in = self.f_proj_1(x), self.g_proj_1(x), self.w_b(x)
+      f_in, b_in = self.f_proj_1(x), self.w_b(x)
+      g_in = self.g_proj(x) if self.full_rank_output_gate else self.g_proj_1(x)
       # Named so the custom remat policy can keep the projections (query/key/value_proj=device)
       # and skip recomputing them and their weight all-gathers in the bwd.
       q_in, k_in, v_in = (
@@ -290,12 +296,16 @@ class OLMoE3KimiDeltaAttention(nnx.Module):
       else:
         out = _delta_rule_scan(q, k, v.astype(jnp.float32), jnp.exp(log_decay), beta, resets)
 
-    gate = jax.nn.sigmoid(self.g_proj_2(g_in).reshape(batch, seq_len, heads, dv))
+    gate = jax.nn.sigmoid(self._gate_logits(g_in).reshape(batch, seq_len, heads, dv))
     out = self.o_norm(out.astype(x.dtype)) * gate
     out = self.w_out(out.reshape(batch, seq_len, heads * dv))
     if self.mesh.shape.get("data", 1) == 1 and self.config.moe_a2a_token_chunks <= 2:
       out = checkpoint_name(out, "out_proj")
     return out
+
+  def _gate_logits(self, g_in):
+    """Output-gate logits from the gate input: g_proj_2 of the low-rank input, or the full-rank projection as is."""
+    return g_in if self.full_rank_output_gate else self.g_proj_2(g_in)
 
   def _use_flat_head_layout(self, seq_len: int) -> bool:
     """Whether the `kda_flat_head_layout` path applies (token-major fused Pallas KDA, chunk-aligned length)."""
@@ -355,7 +365,7 @@ class OLMoE3KimiDeltaAttention(nnx.Module):
         q, k, v, log_decay, beta_c, seg, decay, out_dtype=q_in.dtype
     )  # [B, T, H * dv]
 
-    gate = jax.nn.sigmoid(self.g_proj_2(g_in))  # [B, T, H * dv]
+    gate = jax.nn.sigmoid(self._gate_logits(g_in))  # [B, T, H * dv]
     out = self._o_norm_flat(out.astype(q_in.dtype)) * gate
     out = self.w_out(out)
     if self.mesh.shape.get("data", 1) == 1 and cfg.moe_a2a_token_chunks <= 2:
@@ -510,7 +520,8 @@ class OLMoE3KimiDeltaAttention(nnx.Module):
     unchanged; one wide matmul fills the MXU better than six narrow ones and
     turns six bwd input-gradient matmuls into one.
     """
-    mods = (self.w_q, self.w_k, self.w_v, self.f_proj_1, self.g_proj_1, self.w_b)
+    g_mod = self.g_proj if self.full_rank_output_gate else self.g_proj_1
+    mods = (self.w_q, self.w_k, self.w_v, self.f_proj_1, g_mod, self.w_b)
     dtype = self.config.dtype
     kernels = [jnp.asarray(m.kernel[...], dtype) for m in mods]
     kernel = jnp.concatenate(kernels, axis=-1)
@@ -544,7 +555,10 @@ class OLMoE3KimiDeltaAttention(nnx.Module):
       )
       out = checkpoint_name(out, "kda_proj")
     bounds = np.cumsum([k.shape[-1] for k in kernels])[:-1]
-    return jnp.split(out, bounds, axis=-1)
+    q_in, k_in, v_in, f_in, g_in, b_in = jnp.split(out, bounds, axis=-1)
+    if self.full_rank_output_gate:  # the full-rank gate's bias (the concatenated kernel has none)
+      g_in = g_in + jnp.asarray(self.g_proj.bias[...], dtype)
+    return q_in, k_in, v_in, f_in, g_in, b_in
 
   def _tokamax_kda(self, q, k, v, raw_g, beta, decoder_segment_ids) -> jnp.ndarray:
     """Fused KDA via tokamax (PR #1103, experimental). Raw q/k/v/gate in: the

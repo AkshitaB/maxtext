@@ -1194,8 +1194,7 @@ def calculate_olmoe3_tflops_training_per_device(config, embedding_flops):
           + emb * heads * dv  # w_v
           + emb * dv
           + dv * heads * dk  # decay: f_proj_1, f_proj_2
-          + emb * dv
-          + dv * heads * dv  # gate: g_proj_1, g_proj_2
+          + (emb * heads * dv if config.kda_full_rank_output_gate else emb * dv + dv * heads * dv)  # gate: g_proj
           + emb * heads  # w_b
           + heads * dv * emb  # w_out
           + 3 * heads * dk * dv  # delta-rule state einsums
