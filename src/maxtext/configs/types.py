@@ -2951,6 +2951,14 @@ class OlmoGrainDataset(BaseModel):
           "OLMo-core's EMo router does (an EOS starts the next segment), offset by one; -1 keeps one segment per instance."
       ),
   )
+  olmo_pad_token_id: int = Field(
+      -1,
+      description=(
+          "olmo_grain: with >= 0, positions whose target is this token are left out of the loss, and trailing "
+          "padding out of the n-gram filter (data written padded, as the ladder's midtraining and long-context "
+          "instances); -1 trains on every token."
+      ),
+  )
   olmo_global_indices_path: PathStr = Field(
       "",
       description=(

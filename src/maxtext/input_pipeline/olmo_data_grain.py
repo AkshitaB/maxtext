@@ -451,6 +451,12 @@ def _combine_seed_epoch(seed: int, epoch: int) -> int:
   return int.from_bytes(digest[:8], "little")
 
 
+def _trailing_pad_count(tokens: np.ndarray, pad_token_id: int) -> int:
+  """Number of ``pad_token_id`` tokens at the end of ``tokens``."""
+  not_pad = np.flatnonzero(tokens != pad_token_id)
+  return len(tokens) if not_pad.size == 0 else len(tokens) - 1 - int(not_pad[-1])
+
+
 class NgramFilterTransform(grain.transforms.Map):
   """Add an ``instance_mask`` field per OLMo-core's repetition filter.
 
@@ -467,7 +473,9 @@ class NgramFilterTransform(grain.transforms.Map):
       min_period: int = 1,
       max_count: int = 32,
       mask_value: int = -1,
+      pad_token_id: int = -1,
   ):
+    self._pad_token_id = int(pad_token_id)
     self._max_period = int(max_period)
     self._min_period = int(min_period)
     self._max_count = int(max_count)
@@ -476,6 +484,9 @@ class NgramFilterTransform(grain.transforms.Map):
   def map(self, element: Dict[str, Any]) -> Dict[str, Any]:
     """Add ``instance_mask`` to ``element`` based on the n-gram filter."""
     tokens = element["tokens"]
+    if self._pad_token_id >= 0:
+      # OLMo-core filters an instance before padding it; a run of padding would read as repetition.
+      tokens = tokens[: len(tokens) - _trailing_pad_count(tokens, self._pad_token_id)]
     clean = is_clean_instance(
         tokens,
         repetition_max_period=self._max_period,
@@ -518,10 +529,16 @@ class ShiftToInputsTargets(grain.transforms.Map):
   instance. The mixers must then be told to ignore the segments
   (``olmoe3_segments_for_emo_only``), since OLMo-core's attention and KDA see
   the whole instance.
+
+  With ``pad_token_id`` set, positions whose target is that token are left out of the loss, as OLMo-core masks
+  the padding of instances shorter than the sequence length (the ladder's midtraining and long-context data,
+  written padded by examples' materialize_continuation_data.py). The padding still runs through the model,
+  after the real tokens, so causal attention keeps it from affecting them.
   """
 
-  def __init__(self, segment_eos_token_id: int = -1):
+  def __init__(self, segment_eos_token_id: int = -1, pad_token_id: int = -1):
     self.segment_eos_token_id = int(segment_eos_token_id)
+    self.pad_token_id = int(pad_token_id)
 
   def map(self, element: Dict[str, Any]) -> Dict[str, Any]:
     """Convert ``tokens`` into ``inputs`` / ``targets`` / segmentation tensors."""
@@ -554,6 +571,8 @@ class ShiftToInputsTargets(grain.transforms.Map):
 
     targets_seg = segments * seg_value
     targets_seg[-1] = 0  # never compute loss on the boundary position
+    if self.pad_token_id >= 0:
+      targets_seg[targets == self.pad_token_id] = 0
 
     return {
         "inputs": inputs,
@@ -573,6 +592,7 @@ def make_olmo_grain_data_loader(
     shard_count: int,
     apply_ngram_filter: bool = True,
     segment_eos_token_id: int = -1,
+    pad_token_id: int = -1,
     shift_to_inputs_targets: bool = True,
     path_remap: Optional[Dict[str, str]] = None,
     grain_worker_count: int = 0,
@@ -592,6 +612,7 @@ def make_olmo_grain_data_loader(
     apply_ngram_filter: Add :class:`NgramFilterTransform` (recommended).
     segment_eos_token_id: With >= 0, number EOS-delimited documents in ``inputs_segmentation`` (see
       :class:`ShiftToInputsTargets`); -1 keeps one segment per instance.
+    pad_token_id: With >= 0, leave padding out of the loss and out of the n-gram filter; -1 trains on every token.
     shift_to_inputs_targets: Add :class:`ShiftToInputsTargets` so the loader
       yields the ``inputs``/``targets`` shape MaxText's trainer expects.
     path_remap: Pass-through to :class:`OlmoNpyDataSource`.
@@ -631,9 +652,9 @@ def make_olmo_grain_data_loader(
 
   ops: List[Any] = []
   if apply_ngram_filter:
-    ops.append(NgramFilterTransform())
+    ops.append(NgramFilterTransform(pad_token_id=pad_token_id))
   if shift_to_inputs_targets:
-    ops.append(ShiftToInputsTargets(segment_eos_token_id))
+    ops.append(ShiftToInputsTargets(segment_eos_token_id, pad_token_id))
   ops.append(grain.transforms.Batch(batch_size=batch_size, drop_remainder=True))
 
   # Both samplers already shard by host (shard_index/shard_count). Handing Grain a real

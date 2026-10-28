@@ -142,6 +142,7 @@ def _make_loader_for_host(
       shard_count=shard_count,
       apply_ngram_filter=getattr(config, "olmo_apply_ngram_filter", True),
       segment_eos_token_id=int(getattr(config, "olmo_segment_eos_token_id", -1)),
+      pad_token_id=int(getattr(config, "olmo_pad_token_id", -1)),
       shift_to_inputs_targets=True,
       path_remap=_build_path_remap(config),
       grain_worker_count=worker_count,
