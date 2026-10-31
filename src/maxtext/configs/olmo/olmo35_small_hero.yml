@@ -57,7 +57,11 @@ shard_optimizer_over_data: true  # Zero-1 over the 48 data-parallel ranks
 # int() step counts are exact): the trunk to step F, then a linear decay to 0 over the N appended steps.
 # The schedule is baked into the LR curve: set once, never change it on a resume.
 steps: 556309
-learning_rate: 2.5712e-4  # PLACEHOLDER: 1.1e-3 x 0.23375. Set to (best 1xC LR) x 0.23375 once the sweep picks it.
+# The 1xC sweep (1.1e-3, 1.56e-3, 2.2e-3, 3.1e-3), scored as Tanush's fit was (mean train CE over the final 250M
+# tokens, a parabola in log2 LR through the best point and its neighbours): train CE 1.8003 / 1.7863 / 1.7898 / 1.8055,
+# vertex 1.727e-3, x 0.23375 = 4.04e-4. Equivalently base_lr = lr x D^0.281 = 2.0 with D in tokens (way 2; we used the
+# ratio). Mean val CE over the 11 perplexity sets would put the vertex at 2.10e-3 (4.9e-4).
+learning_rate: 4.04e-4
 lr_schedule_type: "wsd"
 wsd_decay_steps_fraction: 0.0  # the trunk never decays; the decays are branches
 wsd_decay_style: "linear"
