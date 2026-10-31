@@ -182,7 +182,6 @@ def make_olmo_grain_train_iterator(config, global_mesh, process_indices):
           apply_ngram_filter=getattr(config, "olmo_apply_ngram_filter", True),
           segment_eos_token_id=int(getattr(config, "olmo_segment_eos_token_id", -1)),
           segment_eos_ends_document=bool(getattr(config, "olmo_segment_eos_ends_document", False)),
-      segment_eos_ends_document=bool(getattr(config, "olmo_segment_eos_ends_document", False)),
           shift_to_inputs_targets=True,
           path_remap=_build_path_remap(config),
           grain_worker_count=worker_count,
