@@ -3001,6 +3001,13 @@ class OlmoGrainDataset(BaseModel):
           "OLMo-core's EMo router does (an EOS starts the next segment), offset by one; -1 keeps one segment per instance."
       ),
   )
+  olmo_segment_eos_ends_document: bool = Field(
+      False,
+      description=(
+          "olmo_grain: with olmo_segment_eos_token_id >= 0, keep each EOS in the document it ends (OLMo-core's "
+          "segment_ids_from_eos since allenai/OLMo-core#872: eos.cumsum() - eos) rather than starting the next one."
+      ),
+  )
   olmo_global_indices_path: PathStr = Field(
       "",
       description=(
