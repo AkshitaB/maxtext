@@ -1479,6 +1479,11 @@ def run_olmo_ppl_modularity(config, mesh, state, jit_model_ppl, state_mesh_shard
     layer_map = _match_layers(next(iter(set_sums.values())).keys(), keep_paths.keys())
     max_logging.log(f"modularity: calibrated {len(set_sums)} sets over {len(layer_map)} MoE layers")
     results["modularity/calibration_tokens"] = set_tokens
+    # Each set's per-layer full-softmax router probability sums, for specialization analyses (domain-expert mutual
+    # information, keep-set overlap) off the job.
+    results["modularity/calibration_sums"] = {
+        label: {layer: [float(x) for x in v] for layer, v in sums.items()} for label, sums in set_sums.items()
+    }
     t0 = time.perf_counter()
     results.update(evaluator.run(p_step, state, data_sharding, prefix="full/"))
     max_logging.log(f"modularity: full done ({time.perf_counter() - t0:.0f}s)")
