@@ -1511,6 +1511,16 @@ class MoEGeneral(BaseModel):
           " <base_output_directory>/<run_name>/olmo_decode.json. Rows are max_target_length long."
       ),
   )
+  olmo_score_requests_path: str = Field(
+      "",
+      description=(
+          "olmo_ppl_eval_only: instead of the perplexity evals, score these rows (a JSON {\"rows\": [{\"id\", \"tokens\","
+          " \"probes\": [[[position, token], ...], ...]}]}, at most 4 probes a row): for each probe, the sum of the"
+          " log-probabilities of its tokens at its positions (log-softmax of the logits at position p for token t), on"
+          " the EMO eval pool. Written to <base_output_directory>/<run_name>/olmo_score.json. Used to reproduce"
+          " OLMo-core's in-loop downstream evals (the requests are built with ai2-olmo-eval)."
+      ),
+  )
   olmo_decode_max_new_tokens: int = Field(64, description="olmo_decode: tokens generated per prompt (stops early at EOS).")
   olmo_ppl_eval_only: bool = Field(
       False,

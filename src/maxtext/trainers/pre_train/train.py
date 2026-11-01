@@ -1566,6 +1566,72 @@ def run_olmo_decode(config, mesh, state, jit_model_ppl, state_mesh_shardings, ev
   return {"decode": out, "max_new_tokens": max_new}
 
 
+_SCORE_PROBES = 4
+
+
+def olmo_score_step(model, config, state, data, dropout_rng=None):
+  """For each row and probe k, the summed log-prob of probe_target_k's tokens (-1 = no probe at that position)."""
+  del dropout_rng
+  from maxtext.models import olmoe3  # pylint: disable=import-outside-toplevel
+
+  state = nnx.merge(model, state)
+  with olmoe3.emo_eval_pools():
+    logits = state.model(
+        decoder_input_tokens=data["inputs"],
+        decoder_positions=data["inputs_position"],
+        decoder_segment_ids=data["inputs_segmentation"],
+        enable_dropout=False,
+        decoder_target_tokens=data["targets"],
+        decoder_target_mask=data["targets_segmentation"],
+    )
+  if logits is None:
+    raise ValueError("olmo_score needs full logits: set fused_lm_head_ce=False and num_vocab_tiling=1.")
+  lse = jax.nn.logsumexp(logits.astype(jnp.float32), axis=-1)  # [B, S]
+  out = []
+  for k in range(_SCORE_PROBES):
+    t = data[f"probe_target_{k}"]
+    picked = jnp.take_along_axis(logits, jnp.maximum(t, 0)[..., None], axis=-1)[..., 0].astype(jnp.float32)
+    out.append(jnp.sum(jnp.where(t >= 0, picked - lse, 0.0), axis=-1))
+  return {"logprob": jnp.stack(out, axis=-1)}  # [B, probes]
+
+
+def run_olmo_score(config, mesh, state, jit_model_ppl, state_mesh_shardings, evaluator, data_sharding):
+  """olmo_score_requests_path: summed log-probs of each row's probes (see the config field)."""
+  import json  # pylint: disable=import-outside-toplevel
+  from etils import epath  # pylint: disable=import-outside-toplevel
+
+  rows_in = json.loads(epath.Path(config.olmo_score_requests_path).read_text())["rows"]
+  seq_len, rows, pad, usable = evaluator.seq_len, evaluator.rows_loaded, evaluator.pad, evaluator.rows_per_batch
+  p_score = train_utils.jit_eval_step(config, jit_model_ppl, state_mesh_shardings, data_sharding, olmo_score_step)
+  scores, t0 = {}, time.perf_counter()
+  with jax.set_mesh(mesh), logical_axis_rules(config.logical_axis_rules_for_eval):
+    for start in range(0, len(rows_in), usable):
+      chunk = rows_in[start : start + usable]
+      inputs = np.full((rows, seq_len), pad, np.int32)
+      seg = np.zeros((rows, seq_len), np.int32)
+      probes = np.full((_SCORE_PROBES, rows, seq_len), -1, np.int32)
+      for i, r in enumerate(chunk):
+        t = r["tokens"]
+        if len(t) > seq_len or len(r["probes"]) > _SCORE_PROBES:
+          raise ValueError(f"olmo_score: row {r['id']} doesn't fit (len {len(t)}, {len(r['probes'])} probes)")
+        inputs[i, : len(t)] = t
+        seg[i, : len(t)] = 1
+        for k, pr in enumerate(r["probes"]):
+          for pos, tok in pr:
+            probes[k, i, pos] = tok
+      pos_arr = np.where(seg > 0, np.arange(seq_len, dtype=np.int32)[None, :], 0).astype(np.int32)
+      arrays = {"inputs": inputs, "inputs_position": pos_arr, "inputs_segmentation": seg, "targets": inputs,
+                "targets_position": pos_arr, "targets_segmentation": seg}
+      arrays.update({f"probe_target_{k}": probes[k] for k in range(_SCORE_PROBES)})
+      batch = {k: jax.make_array_from_callback(v.shape, data_sharding, lambda idx, v=v: v[idx]) for k, v in arrays.items()}
+      lp = np.asarray(multihost_utils.process_allgather(p_score(state, batch)["logprob"], tiled=True))
+      for i, r in enumerate(chunk):
+        scores[r["id"]] = [float(x) for x in lp[i, : len(r["probes"])]]
+      if (start // usable) % 20 == 0:
+        max_logging.log(f"olmo_score: {start + len(chunk)}/{len(rows_in)} rows ({time.perf_counter() - t0:.0f}s)")
+  return {"scores": scores}
+
+
 def run_olmo_ppl_eval_only(config, mesh, state, jit_model_ppl, state_mesh_shardings, ppl_eval, start_step):
   """olmo_ppl_eval_only: one pass of the perplexity evals on the restored model, once per EMO eval pool in
   olmo_ppl_eval_emo_pools (each its own program), written to <base_output_directory>/<run_name>/olmo_ppl_eval.json."""
@@ -1574,6 +1640,9 @@ def run_olmo_ppl_eval_only(config, mesh, state, jit_model_ppl, state_mesh_shardi
   results = {"start_step": int(start_step), "load_parameters_path": config.load_parameters_path}
   if config.olmo_decode_prompts_path:
     results.update(run_olmo_decode(config, mesh, state, jit_model_ppl, state_mesh_shardings, evaluator, data_sharding))
+    pools = []
+  elif config.olmo_score_requests_path:
+    results.update(run_olmo_score(config, mesh, state, jit_model_ppl, state_mesh_shardings, evaluator, data_sharding))
     pools = []
   elif evaluator.modularity_fractions:
     p_step = train_utils.jit_eval_step(
@@ -1598,7 +1667,8 @@ def run_olmo_ppl_eval_only(config, mesh, state, jit_model_ppl, state_mesh_shardi
     import json  # pylint: disable=import-outside-toplevel
     from etils import epath  # pylint: disable=import-outside-toplevel
 
-    name = "olmo_decode.json" if config.olmo_decode_prompts_path else "olmo_ppl_eval.json"
+    name = ("olmo_decode.json" if config.olmo_decode_prompts_path
+            else "olmo_score.json" if config.olmo_score_requests_path else "olmo_ppl_eval.json")
     path = epath.Path(config.base_output_directory) / config.run_name / name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(results, indent=1, sort_keys=True))
