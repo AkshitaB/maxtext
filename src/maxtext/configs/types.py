@@ -1472,6 +1472,29 @@ class MoEGeneral(BaseModel):
   )
   olmo_ppl_eval_eos_token_id: int = Field(100257, description="olmo_ppl_eval: EOS ending each document.")
   olmo_ppl_eval_pad_token_id: int = Field(100277, description="olmo_ppl_eval: padding token.")
+  olmo_ppl_eval_position_buckets: list[int] = Field(
+      default_factory=list,
+      description=(
+          "olmo_ppl_eval: also report each set's CE per bucket of token positions within the document, with these"
+          " ascending bucket edges (e.g. [0, 16, 64, 256, 1024, 8192]): eval/lm/<set>/pos<a>-<b>/CE loss is the mean"
+          " next-token CE of the predictions made at positions a <= t < b (and .../tokens their count). One extra"
+          " pass over the set per bucket. Empty: off."
+      ),
+  )
+  olmo_ppl_eval_emo_pools: list[int] = Field(
+      default_factory=list,
+      description=(
+          "olmo_ppl_eval: run the evals once per EMO eval pool size in this list (each its own compiled program),"
+          " reported as eval/lm/emo_pool<k>/<set>/...; empty: just emo_eval_document_expert_pool, unprefixed."
+      ),
+  )
+  olmo_ppl_eval_only: bool = Field(
+      False,
+      description=(
+          "Restore the model (load_parameters_path or the run's checkpoint), run olmo_ppl_eval once, write the"
+          " results to <base_output_directory>/<run_name>/olmo_ppl_eval.json and exit without training."
+      ),
+  )
   olmoe3_router_metrics_interval: NonNegativeInt = Field(
       0,
       description=(

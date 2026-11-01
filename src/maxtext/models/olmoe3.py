@@ -82,15 +82,20 @@ _ROUTER_Z_LOSS_WEIGHT = 1e-5
 # Set while tracing an eval program that should route on the EMO eval pool. MaxText calls the model the same way in
 # train and eval steps (and enable_dropout is off in training too), so the eval step says so explicitly.
 _EMO_EVAL_POOLS = contextvars.ContextVar("olmoe3_emo_eval_pools", default=False)
+# The eval pool size to trace with instead of emo_eval_document_expert_pool (None: the config's).
+_EMO_EVAL_POOL_SIZE = contextvars.ContextVar("olmoe3_emo_eval_pool_size", default=None)
 
 
 @contextlib.contextmanager
-def emo_eval_pools():
-  """Within this context, EMO routing uses ``emo_eval_document_expert_pool`` instead of sampling pool sizes."""
+def emo_eval_pools(pool_size=None):
+  """Within this context, EMO routing uses a fixed pool instead of sampling pool sizes: ``pool_size`` if given, else
+  ``emo_eval_document_expert_pool``."""
   token = _EMO_EVAL_POOLS.set(True)
+  size_token = _EMO_EVAL_POOL_SIZE.set(pool_size)
   try:
     yield
   finally:
+    _EMO_EVAL_POOL_SIZE.reset(size_token)
     _EMO_EVAL_POOLS.reset(token)
 
 
@@ -1435,7 +1440,8 @@ class OLMoE3LatentRoutedMoE(moe.RoutedMoE):
       # One draw per document: every token reads the draw at its document start.
       pool = jnp.take_along_axis(draws, start, axis=1)
     else:
-      pool = jnp.full((batch, seq_len), cfg.emo_eval_document_expert_pool, dtype=jnp.int32)
+      eval_pool = _EMO_EVAL_POOL_SIZE.get() or cfg.emo_eval_document_expert_pool
+      pool = jnp.full((batch, seq_len), eval_pool, dtype=jnp.int32)
 
     if cfg.moe_lean_routing:
       keep = self._emo_keep_by_threshold(

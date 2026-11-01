@@ -24,6 +24,10 @@ left with the last one ignored, and the per-set metric is the mean of the per-to
 and PPL = exp(CE). Here each eval batch holds documents of a single set, so the eval step's token-loss sum
 (``evaluation/total_loss``, minus the z-loss it includes) is that set's numerator; the denominator is counted on the
 host. The router uses the EMO eval pool, as OLMo-core's model in eval mode does.
+
+With ``olmo_ppl_eval_position_buckets`` each set is also scored per bucket of positions within the document: the same
+batches with ``targets_segmentation`` cut down to the predictions made at positions a <= t < b, so
+``.../pos<a>-<b>/CE loss`` is a plain mean over those predictions (no zero-loss last token in the denominator).
 """
 
 import os
@@ -87,6 +91,9 @@ class OlmoPplEval:
     # arrays keep the loaded size, which the input sharding needs, with weightless padding rows after them.
     self.rows_per_batch = int(config.micro_batch_size_to_eval_on)
     self.rows_loaded = int(config.global_batch_size_to_load_eval)
+    self.buckets = [int(b) for b in getattr(config, "olmo_ppl_eval_position_buckets", [])]
+    if any(b >= c for b, c in zip(self.buckets, self.buckets[1:])):
+      raise ValueError(f"olmo_ppl_eval_position_buckets must be ascending, got {self.buckets}.")
     self.eos = int(config.olmo_ppl_eval_eos_token_id)
     self.pad = int(config.olmo_ppl_eval_pad_token_id)
     # [(label, [(batch arrays, number of documents in it)], denominator tokens)]
@@ -114,32 +121,45 @@ class OlmoPplEval:
     and after the run's last step, so a run whose length isn't a multiple still ends with an eval."""
     return self.interval > 0 and ((step + 1) % self.interval == 0 or step == self.last_step)
 
-  def run(self, p_eval_step, state, data_sharding) -> dict[str, Any]:
-    """``eval/lm/<label>/CE loss`` and ``.../PPL`` for every set."""
+  @staticmethod
+  def _ce_sum(p_eval_step, state, data_sharding, rows) -> float:
+    """The batch's next-token CE summed over its scored targets (the eval step's loss sum minus its z-loss)."""
+    batch = {k: jax.make_array_from_callback(v.shape, data_sharding, lambda idx, v=v: v[idx]) for k, v in rows.items()}
+    scalars = p_eval_step(state, batch)["scalar"]
+    total = float(scalars["evaluation/total_loss"])  # token-loss sum, z-loss included
+    weights = float(scalars["evaluation/total_weights"])
+    z_mean = float(scalars["evaluation/z_loss"])  # per-token z-loss (already weighted by z_loss_multiplier)
+    return total - z_mean * weights
+
+  def run(self, p_eval_step, state, data_sharding, prefix: str = "") -> dict[str, Any]:
+    """``eval/lm/<prefix><label>/CE loss`` and ``.../PPL`` for every set, plus the per-position buckets if set."""
     out = {}
     for label, batches, denominator in self.sets:
-      ce_sum = 0.0
-      for rows in batches:
-        batch = {
-            k: jax.make_array_from_callback(v.shape, data_sharding, lambda idx, v=v: v[idx]) for k, v in rows.items()
-        }
-        scalars = p_eval_step(state, batch)["scalar"]
-        total = float(scalars["evaluation/total_loss"])  # token-loss sum, z-loss included
-        weights = float(scalars["evaluation/total_weights"])
-        z_mean = float(scalars["evaluation/z_loss"])  # per-token z-loss (already weighted by z_loss_multiplier)
-        ce_sum += total - z_mean * weights
-      ce = ce_sum / max(denominator, 1)
-      out[f"eval/lm/{label}/CE loss"] = ce
-      out[f"eval/lm/{label}/PPL"] = float(np.exp(ce))
+      ce = sum(self._ce_sum(p_eval_step, state, data_sharding, rows) for rows in batches) / max(denominator, 1)
+      out[f"eval/lm/{prefix}{label}/CE loss"] = ce
+      out[f"eval/lm/{prefix}{label}/PPL"] = float(np.exp(ce))
+      for lo, hi in zip(self.buckets, self.buckets[1:]):
+        ce_sum, count = 0.0, 0
+        for rows in batches:
+          pos = rows["targets_position"]
+          mask = (rows["targets_segmentation"] != 0) & (pos >= lo) & (pos < hi)
+          n = int(mask.sum())
+          if n == 0:
+            continue
+          ce_sum += self._ce_sum(p_eval_step, state, data_sharding, {**rows, "targets_segmentation": mask.astype(np.int32)})
+          count += n
+        out[f"eval/lm/{prefix}{label}/pos{lo}-{hi}/CE loss"] = ce_sum / count if count else float("nan")
+        out[f"eval/lm/{prefix}{label}/pos{lo}-{hi}/tokens"] = count
     return out
 
 
-def ppl_eval_step(eval_step):
-  """``eval_step`` with the OLMoE3 router on its EMO eval pool, as OLMo-core evaluates in eval mode."""
+def ppl_eval_step(eval_step, pool_size=None):
+  """``eval_step`` with the OLMoE3 router on its EMO eval pool, as OLMo-core evaluates in eval mode (``pool_size``
+  instead of ``emo_eval_document_expert_pool`` if given; the size is fixed when the step is traced)."""
   from maxtext.models import olmoe3  # pylint: disable=import-outside-toplevel
 
   def step(*args, **kwargs):
-    with olmoe3.emo_eval_pools():
+    with olmoe3.emo_eval_pools(pool_size):
       return eval_step(*args, **kwargs)
 
   step.__name__ = "ppl_eval_step"

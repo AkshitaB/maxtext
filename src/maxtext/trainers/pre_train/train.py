@@ -1389,6 +1389,33 @@ def start_run_clock(config, start_step, warmup_fn=None, barrier_fn=None, python_
   mllog_utils.block_start(config, start_step)
 
 
+def run_olmo_ppl_eval_only(config, mesh, state, jit_model_ppl, state_mesh_shardings, ppl_eval, start_step):
+  """olmo_ppl_eval_only: one pass of the perplexity evals on the restored model, once per EMO eval pool in
+  olmo_ppl_eval_emo_pools (each its own program), written to <base_output_directory>/<run_name>/olmo_ppl_eval.json."""
+  evaluator, data_sharding = ppl_eval
+  pools = list(config.olmo_ppl_eval_emo_pools) or [None]
+  results = {"start_step": int(start_step), "load_parameters_path": config.load_parameters_path}
+  for pool in pools:
+    p_step = train_utils.jit_eval_step(
+        config, jit_model_ppl, state_mesh_shardings, data_sharding, olmo_ppl_eval.ppl_eval_step(eval_step, pool)
+    )
+    prefix = f"emo_pool{pool}/" if pool is not None else ""
+    t0 = time.perf_counter()
+    with jax.set_mesh(mesh), logical_axis_rules(config.logical_axis_rules_for_eval):
+      out = evaluator.run(p_step, state, data_sharding, prefix=prefix)
+    max_logging.log(f"olmo_ppl_eval_only pool={pool} ({time.perf_counter() - t0:.0f}s): " + ", ".join(
+        f"{k}={v:.4f}" for k, v in out.items() if k.endswith("CE loss")))
+    results.update(out)
+  if jax.process_index() == 0:
+    import json  # pylint: disable=import-outside-toplevel
+    from etils import epath  # pylint: disable=import-outside-toplevel
+
+    path = epath.Path(config.base_output_directory) / config.run_name / "olmo_ppl_eval.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(results, indent=1, sort_keys=True))
+    max_logging.log(f"olmo_ppl_eval_only: wrote {path}")
+
+
 def train_loop(config, recorder, state=None, elastic_retry_cache=None):
   """Main Training loop.
 
@@ -1421,7 +1448,8 @@ def train_loop(config, recorder, state=None, elastic_retry_cache=None):
   train_utils.maybe_apply_dcn_throttling(config)
 
   start_step = get_first_step(model, state)  # this is the start_step for training
-  train_utils.validate_completed_steps(start_step, config.steps)
+  if not config.olmo_ppl_eval_only:
+    train_utils.validate_completed_steps(start_step, config.steps)
 
   jit_model_dropless = None
   jit_model_eval = None
@@ -1485,6 +1513,12 @@ def train_loop(config, recorder, state=None, elastic_retry_cache=None):
         config, jit_model_ppl, state_mesh_shardings, ppl_eval_sharding, olmo_ppl_eval.ppl_eval_step(eval_step)
     )
     ppl_eval = (olmo_ppl_eval.OlmoPplEval(config), ppl_eval_sharding)
+
+  if config.olmo_ppl_eval_only:
+    if ppl_eval is None:
+      raise ValueError("olmo_ppl_eval_only needs olmo_ppl_eval_interval > 0.")
+    run_olmo_ppl_eval_only(config, mesh, state, jit_model_ppl, state_mesh_shardings, ppl_eval, start_step)
+    return state
 
   p_train_step_dropless = None
   p_eval_step_dropless = None

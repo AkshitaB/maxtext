@@ -46,7 +46,7 @@ class OlmoPplEvalRowsTest(unittest.TestCase):
     np.testing.assert_array_equal(rows["targets_segmentation"], [[1, 1, 0, 0], [1, 0, 0, 0]])
     np.testing.assert_array_equal(rows["inputs_segmentation"], [[1, 1, 1, 0], [1, 1, 0, 0]])
 
-  def _eval(self, loaded, scored):
+  def _eval(self, loaded, scored, buckets=()):
     """An OlmoPplEval over sets a (three documents) and b (one), loading `loaded` rows and scoring `scored`."""
     with tempfile.TemporaryDirectory() as d:
       for name, tokens in (("a", [1, 2, EOS, 3, EOS, 4, 5, 6, EOS]), ("b", [7, EOS])):
@@ -62,6 +62,7 @@ class OlmoPplEvalRowsTest(unittest.TestCase):
           olmo_ppl_eval_pad_token_id=PAD,
           olmo_ppl_eval_sets=["a", "b"],
           olmo_ppl_eval_dir=d,
+          olmo_ppl_eval_position_buckets=list(buckets),
       )
       return olmo_ppl_eval.OlmoPplEval(cfg)
 
@@ -88,6 +89,30 @@ class OlmoPplEvalRowsTest(unittest.TestCase):
       np.testing.assert_array_equal(rows["targets_segmentation"][2:], np.zeros((2, 4)))  # unscored rows
     scored_targets = sum(int(rows["targets_segmentation"][:2].sum()) for rows in batches)
     self.assertEqual(scored_targets, (3 - 1) + (2 - 1) + (4 - 1))
+
+
+  def test_position_buckets_score_only_their_positions(self):
+    """A stand-in eval step whose per-token loss is the target token id: each bucket's CE is the mean target id over
+    the predictions made at its positions, and the full-set CE keeps OLMo-core's sum(L) denominator."""
+    ev = self._eval(loaded=2, scored=2, buckets=[0, 1, 2, 4])
+    sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+
+    def p_eval_step(state, batch):
+      del state
+      w = batch["targets_segmentation"] != 0
+      return {"scalar": {"evaluation/total_loss": jnp.sum(jnp.where(w, batch["targets"], 0)),
+                         "evaluation/total_weights": jnp.sum(w), "evaluation/z_loss": 0.0}}
+
+    out = ev.run(p_eval_step, None, sharding)
+    # Set a: documents [1, 2, EOS], [3, EOS], [4, 5, 6, EOS]; position t predicts token t + 1.
+    self.assertAlmostEqual(out["eval/lm/a-validation/CE loss"], (2 + EOS + EOS + 5 + 6 + EOS) / 9)
+    self.assertAlmostEqual(out["eval/lm/a-validation/pos0-1/CE loss"], (2 + EOS + 5) / 3)
+    self.assertAlmostEqual(out["eval/lm/a-validation/pos1-2/CE loss"], (EOS + 6) / 2)
+    self.assertAlmostEqual(out["eval/lm/a-validation/pos2-4/CE loss"], EOS)
+    self.assertEqual([out[f"eval/lm/a-validation/pos{b}/tokens"] for b in ("0-1", "1-2", "2-4")], [3, 2, 1])
+    self.assertEqual(out["eval/lm/b-validation/pos1-2/tokens"], 0)
+    prefixed = ev.run(p_eval_step, None, sharding, prefix="emo_pool32/")
+    self.assertIn("eval/lm/emo_pool32/a-validation/pos0-1/CE loss", prefixed)
 
 
 class EmoEvalPoolsTest(unittest.TestCase):
@@ -120,6 +145,16 @@ class EmoEvalPoolsTest(unittest.TestCase):
     with olmoe3.emo_eval_pools():
       logits, masked = self._mask(jax.random.PRNGKey(1))
     np.testing.assert_array_equal(np.asarray(masked), np.asarray(logits))  # eval pool 8 = every expert
+
+  def test_eval_context_pool_size_override(self):
+    """``emo_eval_pools(k)`` routes every document within its top k experts by the document's summed scores."""
+    with olmoe3.emo_eval_pools(3):
+      _, masked = self._mask(jax.random.PRNGKey(1))
+    kept = np.isfinite(np.asarray(masked)).sum(-1)
+    np.testing.assert_array_equal(kept, np.full(kept.shape, 3))
+    with olmoe3.emo_eval_pools():  # the override doesn't leak into the next context
+      logits, masked = self._mask(jax.random.PRNGKey(1))
+    np.testing.assert_array_equal(np.asarray(masked), np.asarray(logits))
 
 
 class PplEvalGraphdefTest(unittest.TestCase):
