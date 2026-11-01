@@ -79,6 +79,33 @@ def build_rows(docs: list[np.ndarray], seq_len: int, pad_token_id: int) -> dict[
   }
 
 
+def split_calibration(docs: list[np.ndarray], fraction: float, seed: int) -> tuple[list[np.ndarray], list[np.ndarray]]:
+  """Disjoint (calibration, evaluation) documents: a seeded shuffle, at least one of each when there are two."""
+  n = len(docs)
+  n_cal = min(max(1, int(round(fraction * n))), n - 1) if n > 1 else 0
+  order = np.random.default_rng(seed).permutation(n)
+  cal, ev = sorted(order[:n_cal].tolist()), sorted(order[n_cal:].tolist())
+  return [docs[i] for i in cal], [docs[i] for i in ev]
+
+
+def top_p_mask(scores: np.ndarray, budget: int) -> np.ndarray:
+  """0/1 mask over the ``budget`` highest scores; ties go to the lower expert id (the ladder's ``top_p_mask``)."""
+  order = np.argsort(-np.asarray(scores, dtype=np.float64), kind="stable")
+  mask = np.zeros(len(scores), dtype=np.float32)
+  mask[order[:budget]] = 1.0
+  return mask
+
+
+def pooled_scores(set_sums: dict[str, dict[Any, np.ndarray]], set_tokens: dict[str, int]) -> dict[Any, np.ndarray]:
+  """Set-agnostic scores per layer: each set's sums divided by its calibration tokens, averaged with equal set
+  weight (the ladder's ``pooled_layer_scores``), so long-document sets don't dominate."""
+  names = sorted(set_sums)
+  return {
+      layer: np.mean([set_sums[n][layer] / max(set_tokens[n], 1) for n in names], axis=0)
+      for layer in set_sums[names[0]]
+  }
+
+
 class OlmoPplEval:
   """Builds the eval batches once and runs them every ``olmo_ppl_eval_interval`` steps."""
 
@@ -96,25 +123,43 @@ class OlmoPplEval:
       raise ValueError(f"olmo_ppl_eval_position_buckets must be ascending, got {self.buckets}.")
     self.eos = int(config.olmo_ppl_eval_eos_token_id)
     self.pad = int(config.olmo_ppl_eval_pad_token_id)
+    # Modularity: each set's documents split into calibration documents (self.calibration) and the evaluation
+    # documents that self.sets then scores.
+    self.modularity_fractions = [float(f) for f in getattr(config, "olmo_ppl_eval_modularity_fractions", [])]
+    cal_fraction = float(getattr(config, "olmo_ppl_eval_modularity_calibration_fraction", 0.25))
+    cal_seed = int(getattr(config, "olmo_ppl_eval_modularity_seed", 0))
     # [(label, [(batch arrays, number of documents in it)], denominator tokens)]
     self.sets = []
+    # [(label, [batch arrays], real tokens)] when modularity is on
+    self.calibration = []
     for name in config.olmo_ppl_eval_sets:
       path = os.path.join(config.olmo_ppl_eval_dir, name, "val", "part-0-00000.npy")
       docs = split_documents(_read_tokens(path), self.eos, self.seq_len)
+      note = ""
+      if self.modularity_fractions:
+        cal_docs, docs = split_calibration(docs, cal_fraction, cal_seed)
+        cal_tokens = int(sum(len(d) for d in cal_docs))
+        self.calibration.append((f"{name}-validation", self._batches(cal_docs), cal_tokens))
+        note = f" (after {len(cal_docs)} calibration documents, {cal_tokens} tokens)"
       denominator = int(sum(len(d) for d in docs))
-      batches = []
-      for start in range(0, len(docs), self.rows_per_batch):
-        chunk = docs[start : start + self.rows_per_batch]
-        rows = build_rows(chunk, self.seq_len, self.pad)
-        if len(chunk) < self.rows_loaded:  # weightless padding rows: the last batch's, and any the step doesn't score
-          fill = self.rows_loaded - len(chunk)
-          rows = {k: np.concatenate([v, np.zeros((fill,) + v.shape[1:], v.dtype)]) for k, v in rows.items()}
-        batches.append(rows)
+      batches = self._batches(docs)
       self.sets.append((f"{name}-validation", batches, denominator))
       max_logging.log(
           f"olmo_ppl_eval: {name}: {len(docs)} documents, {denominator} tokens, {len(batches)} batches of"
-          f" {self.rows_per_batch} documents ({self.rows_loaded} rows loaded)"
+          f" {self.rows_per_batch} documents ({self.rows_loaded} rows loaded){note}"
       )
+
+  def _batches(self, docs: list[np.ndarray]) -> list[dict[str, np.ndarray]]:
+    """One-document-per-row batches; weightless padding rows fill the last batch and any rows the step doesn't score."""
+    batches = []
+    for start in range(0, len(docs), self.rows_per_batch):
+      chunk = docs[start : start + self.rows_per_batch]
+      rows = build_rows(chunk, self.seq_len, self.pad)
+      if len(chunk) < self.rows_loaded:
+        fill = self.rows_loaded - len(chunk)
+        rows = {k: np.concatenate([v, np.zeros((fill,) + v.shape[1:], v.dtype)]) for k, v in rows.items()}
+      batches.append(rows)
+    return batches
 
   def due(self, step: int) -> bool:
     """After the step that completes a multiple of the interval (OLMo-core evaluates after step N, N % interval == 0),
@@ -131,10 +176,13 @@ class OlmoPplEval:
     z_mean = float(scalars["evaluation/z_loss"])  # per-token z-loss (already weighted by z_loss_multiplier)
     return total - z_mean * weights
 
-  def run(self, p_eval_step, state, data_sharding, prefix: str = "") -> dict[str, Any]:
-    """``eval/lm/<prefix><label>/CE loss`` and ``.../PPL`` for every set, plus the per-position buckets if set."""
+  def run(self, p_eval_step, state, data_sharding, prefix: str = "", only: str | None = None) -> dict[str, Any]:
+    """``eval/lm/<prefix><label>/CE loss`` and ``.../PPL`` for every set (or just the set labelled ``only``), plus
+    the per-position buckets if set."""
     out = {}
     for label, batches, denominator in self.sets:
+      if only is not None and label != only:
+        continue
       ce = sum(self._ce_sum(p_eval_step, state, data_sharding, rows) for rows in batches) / max(denominator, 1)
       out[f"eval/lm/{prefix}{label}/CE loss"] = ce
       out[f"eval/lm/{prefix}{label}/PPL"] = float(np.exp(ce))

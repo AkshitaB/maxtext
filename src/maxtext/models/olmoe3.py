@@ -86,6 +86,28 @@ _EMO_EVAL_POOLS = contextvars.ContextVar("olmoe3_emo_eval_pools", default=False)
 _EMO_EVAL_POOL_SIZE = contextvars.ContextVar("olmoe3_emo_eval_pool_size", default=None)
 
 
+# Set while tracing the modularity calibration program: every MoE decoder layer sows the sum of its full-softmax
+# router probabilities over the batch's real tokens ("olmoe3_calib_scores").
+_OLMOE3_CALIBRATION = contextvars.ContextVar("olmoe3_calibration", default=False)
+
+
+class OLMoE3ExpertKeepVar(nnx.BatchStat):
+  """Per-layer expert keep-set for the modularity evals (olmo_ppl_eval_modularity_fractions): 1 keeps an expert,
+  0 masks its router logit to -inf before top-k. All ones (every expert) unless the eval writes a keep-set into
+  the state. A BatchStat, so params-only restores (load_parameters_path) skip it and the optimizer never sees it.
+  """
+
+
+@contextlib.contextmanager
+def olmoe3_calibration():
+  """Within this context, MoE decoder layers sow their router-probability sums for modularity calibration."""
+  token = _OLMOE3_CALIBRATION.set(True)
+  try:
+    yield
+  finally:
+    _OLMOE3_CALIBRATION.reset(token)
+
+
 @contextlib.contextmanager
 def emo_eval_pools(pool_size=None):
   """Within this context, EMO routing uses a fixed pool instead of sampling pool sizes: ``pool_size`` if given, else
@@ -1685,7 +1707,7 @@ class OLMoE3DecoderLayer(nnx.Module):
     )
 
     if self.is_dense_layer:
-      self.latent_down = self.latent_up = self.moe_block = None
+      self.latent_down = self.latent_up = self.moe_block = self.expert_keep = None
     else:
       latent_dim = cfg.moe_expert_input_dim
       if latent_dim <= 0:
@@ -1716,6 +1738,11 @@ class OLMoE3DecoderLayer(nnx.Module):
           quant=quant,
           rngs=rngs,
           gate_in_features=cfg.emb_dim,
+      )
+      self.expert_keep = (
+          OLMoE3ExpertKeepVar(jnp.ones((cfg.num_experts,), jnp.float32))
+          if getattr(cfg, "olmo_ppl_eval_modularity_fractions", None)
+          else None
       )
 
     if cfg.gathered_weights != "remat":
@@ -1771,6 +1798,15 @@ class OLMoE3DecoderLayer(nnx.Module):
       gate_dtype = jnp.float32 if self.config.float32_gate_logits else self.config.dtype
       router_logits, pre_bias_logits = self.moe_block.gate(ffn_in.astype(gate_dtype))
       router_logits = checkpoint_name(router_logits, "moe_router_logits")
+      if self.expert_keep is not None:
+        if _OLMOE3_CALIBRATION.get():
+          # Modularity calibration: full-softmax router probabilities summed over real tokens (segment id != 0),
+          # from the unmasked logits, as the ladder's modularity eval accumulates them.
+          probs = jax.nn.softmax(router_logits.astype(jnp.float32), axis=-1)
+          real = (decoder_segment_ids != 0) if decoder_segment_ids is not None else jnp.ones(probs.shape[:2], bool)
+          self.sow(nnx.Intermediate, "olmoe3_calib_scores", jnp.sum(probs * real[..., None], axis=(0, 1)))
+        # Modularity keep-set: experts outside it can't be selected (all ones = no restriction).
+        router_logits = jnp.where(self.expert_keep.value > 0, router_logits, -jnp.inf)
       precomputed_gate = (router_logits, pre_bias_logits)
     if self._can_fuse_ffn_in():
       ffn_out, latent_in = self._fused_ffn_in_and_shared_ffn(ffn_in, deterministic=deterministic)

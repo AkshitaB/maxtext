@@ -1389,12 +1389,131 @@ def start_run_clock(config, start_step, warmup_fn=None, barrier_fn=None, python_
   mllog_utils.block_start(config, start_step)
 
 
+def _key_names(path) -> tuple:
+  """A pytree key path as plain names (dict keys, attribute names, sequence indices)."""
+  out = []
+  for k in path:
+    for attr in ("key", "name", "idx"):
+      if hasattr(k, attr):
+        out.append(str(getattr(k, attr)))
+        break
+  return tuple(out)
+
+
+def modularity_calibration_step(model, config, state, data, dropout_rng=None):
+  """Per MoE layer, the full-softmax router probabilities summed over the batch's real tokens, keyed by the
+  layer's module path (the names before ``olmoe3_calib_scores``). Routes on the EMO eval pool, as the ppl evals."""
+  del dropout_rng
+  from maxtext.models import olmoe3  # pylint: disable=import-outside-toplevel
+
+  state = nnx.merge(model, state)
+  with olmoe3.emo_eval_pools(), olmoe3.olmoe3_calibration():
+    _, aux = loss_fn(state.model, config, data, None, None, is_train=False)
+  out = {}
+  for path, val in jax.tree_util.tree_leaves_with_path(aux["intermediate_outputs"]):
+    names = _key_names(path)
+    if "olmoe3_calib_scores" in names:
+      layer = "/".join(names[: names.index("olmoe3_calib_scores")])
+      out.setdefault(layer, val)  # the first sow if a layer ran more than once
+  return out
+
+
+def _expert_keep_paths(state) -> dict:
+  """{layer path: leaf key path} of every OLMoE3ExpertKeepVar in the train state."""
+  found = {}
+  for path, _ in jax.tree_util.tree_leaves_with_path(state):
+    names = _key_names(path)
+    if "expert_keep" in names:
+      found["/".join(names[: names.index("expert_keep")])] = path
+  return found
+
+
+def _match_layers(calib_layers, keep_layers) -> dict:
+  """{calibration layer path: state layer path}. The state paths carry extra leading names (e.g. the train state's
+  ``model``), so a state path matches the calibration path it ends with."""
+  out = {}
+  for c in calib_layers:
+    hits = [k for k in keep_layers if k == c or k.endswith("/" + c)]
+    if len(hits) != 1:
+      raise ValueError(f"modularity: calibration layer {c!r} matches {hits} in the train state")
+    out[c] = hits[0]
+  if len(out) != len(keep_layers):
+    raise ValueError(f"modularity: {len(keep_layers)} keep-set variables but {len(out)} calibrated layers")
+  return out
+
+
+def _with_keep_sets(state, keep_paths: dict, masks: dict):
+  """The state with each layer's keep-set replaced (masks: {state layer path: 0/1 vector}); every other leaf as is.
+  Same shapes and shardings, so the compiled eval programs are reused."""
+  by_path = {jax.tree_util.keystr(keep_paths[layer]): m for layer, m in masks.items()}
+
+  def swap(path, leaf):
+    m = by_path.get(jax.tree_util.keystr(path))
+    return leaf if m is None else jax.device_put(np.asarray(m, dtype=leaf.dtype), leaf.sharding)
+
+  return jax.tree_util.tree_map_with_path(swap, state)
+
+
+def run_olmo_ppl_modularity(config, mesh, state, jit_model_ppl, state_mesh_shardings, evaluator, data_sharding, p_step):
+  """The ladder's modularity eval on the perplexity sets (olmo_ppl_eval_modularity_fractions): calibrate a keep-set
+  per set from its calibration documents, then score the evaluation documents with every expert (``full/``), the
+  set's own top-P experts per layer (``selected_p<P>/``) and the top-P of the equal-weight pooled scores
+  (``pooled_p<P>/``)."""
+  keep_paths = _expert_keep_paths(state)
+  if not keep_paths:
+    raise ValueError("modularity: no OLMoE3ExpertKeepVar in the state (needs an olmoe3 model with MoE layers).")
+  ones = {layer: np.ones(config.num_experts, np.float32) for layer in keep_paths}
+  state = _with_keep_sets(state, keep_paths, ones)
+  p_calib = train_utils.jit_eval_step(config, jit_model_ppl, state_mesh_shardings, data_sharding, modularity_calibration_step)
+  set_sums, set_tokens, results = {}, {}, {}
+  with jax.set_mesh(mesh), logical_axis_rules(config.logical_axis_rules_for_eval):
+    for label, batches, tokens in evaluator.calibration:
+      total = None
+      for rows in batches:
+        batch = {
+            k: jax.make_array_from_callback(v.shape, data_sharding, lambda idx, v=v: v[idx]) for k, v in rows.items()
+        }
+        sums = {k: np.asarray(jax.device_get(v), np.float64) for k, v in p_calib(state, batch).items()}
+        total = sums if total is None else {k: total[k] + sums[k] for k in total}
+      set_sums[label], set_tokens[label] = total, tokens
+    layer_map = _match_layers(next(iter(set_sums.values())).keys(), keep_paths.keys())
+    max_logging.log(f"modularity: calibrated {len(set_sums)} sets over {len(layer_map)} MoE layers")
+    results["modularity/calibration_tokens"] = set_tokens
+    t0 = time.perf_counter()
+    results.update(evaluator.run(p_step, state, data_sharding, prefix="full/"))
+    max_logging.log(f"modularity: full done ({time.perf_counter() - t0:.0f}s)")
+    pooled = olmo_ppl_eval.pooled_scores(set_sums, set_tokens)
+    for fraction in evaluator.modularity_fractions:
+      budget = int(round(fraction * config.num_experts))
+      if budget < config.num_experts_per_tok:
+        max_logging.log(f"modularity: fraction {fraction} -> P={budget} < top_k, skipped")
+        continue
+      t0 = time.perf_counter()
+      masks = {layer_map[c]: olmo_ppl_eval.top_p_mask(v, budget) for c, v in pooled.items()}
+      results.update(evaluator.run(p_step, _with_keep_sets(state, keep_paths, masks), data_sharding, prefix=f"pooled_p{budget}/"))
+      for label, _, _ in evaluator.sets:
+        masks = {layer_map[c]: olmo_ppl_eval.top_p_mask(v, budget) for c, v in set_sums[label].items()}
+        results.update(
+            evaluator.run(p_step, _with_keep_sets(state, keep_paths, masks), data_sharding, prefix=f"selected_p{budget}/", only=label)
+        )
+      max_logging.log(f"modularity: P={budget} done ({time.perf_counter() - t0:.0f}s)")
+  return results
+
+
 def run_olmo_ppl_eval_only(config, mesh, state, jit_model_ppl, state_mesh_shardings, ppl_eval, start_step):
   """olmo_ppl_eval_only: one pass of the perplexity evals on the restored model, once per EMO eval pool in
   olmo_ppl_eval_emo_pools (each its own program), written to <base_output_directory>/<run_name>/olmo_ppl_eval.json."""
   evaluator, data_sharding = ppl_eval
   pools = list(config.olmo_ppl_eval_emo_pools) or [None]
   results = {"start_step": int(start_step), "load_parameters_path": config.load_parameters_path}
+  if evaluator.modularity_fractions:
+    p_step = train_utils.jit_eval_step(
+        config, jit_model_ppl, state_mesh_shardings, data_sharding, olmo_ppl_eval.ppl_eval_step(eval_step)
+    )
+    results.update(
+        run_olmo_ppl_modularity(config, mesh, state, jit_model_ppl, state_mesh_shardings, evaluator, data_sharding, p_step)
+    )
+    pools = []
   for pool in pools:
     p_step = train_utils.jit_eval_step(
         config, jit_model_ppl, state_mesh_shardings, data_sharding, olmo_ppl_eval.ppl_eval_step(eval_step, pool)

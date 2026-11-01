@@ -216,3 +216,41 @@ class PplEvalGraphdefTest(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class ModularityHelpersTest(unittest.TestCase):
+  """Calibration split, keep-set selection and pooling, as the ladder's modularity eval defines them."""
+
+  def test_split_is_disjoint_seeded_and_keeps_one_of_each(self):
+    docs = [np.array([i, EOS], dtype=np.uint32) for i in range(10)]
+    cal, ev = olmo_ppl_eval.split_calibration(docs, 0.25, seed=0)
+    self.assertEqual((len(cal), len(ev)), (2, 8))
+    self.assertFalse({int(d[0]) for d in cal} & {int(d[0]) for d in ev})
+    cal2, _ = olmo_ppl_eval.split_calibration(docs, 0.25, seed=0)
+    self.assertEqual([int(d[0]) for d in cal], [int(d[0]) for d in cal2])
+    cal, ev = olmo_ppl_eval.split_calibration(docs[:2], 0.9, seed=0)  # never leaves no evaluation document
+    self.assertEqual((len(cal), len(ev)), (1, 1))
+
+  def test_top_p_mask_breaks_ties_by_lower_expert_id(self):
+    np.testing.assert_array_equal(olmo_ppl_eval.top_p_mask(np.array([1.0, 3.0, 3.0, 2.0]), 2), [0, 1, 1, 0])
+    np.testing.assert_array_equal(olmo_ppl_eval.top_p_mask(np.array([2.0, 2.0, 2.0]), 2), [1, 1, 0])
+
+  def test_pooled_scores_weight_sets_equally_per_token(self):
+    sums = {"a": {"l0": np.array([10.0, 0.0])}, "b": {"l0": np.array([0.0, 1.0])}}
+    pooled = olmo_ppl_eval.pooled_scores(sums, {"a": 10, "b": 1})
+    np.testing.assert_allclose(pooled["l0"], [0.5, 0.5])  # a's 10x more tokens don't dominate
+
+
+class ModularityLayerMatchTest(unittest.TestCase):
+  """Calibration layer paths (model-rooted) match the keep-set variables' train-state paths by suffix."""
+
+  def test_match_by_suffix_and_reject_ambiguity(self):
+    from maxtext.trainers.pre_train import train  # pylint: disable=import-outside-toplevel
+
+    keep = ["model/decoder/layers_1", "model/decoder/layers_2"]
+    self.assertEqual(
+        train._match_layers(["decoder/layers_1", "decoder/layers_2"], keep),  # pylint: disable=protected-access
+        {"decoder/layers_1": keep[0], "decoder/layers_2": keep[1]},
+    )
+    with self.assertRaises(ValueError):
+      train._match_layers(["decoder/layers_1"], keep)  # pylint: disable=protected-access

@@ -1488,6 +1488,20 @@ class MoEGeneral(BaseModel):
           " reported as eval/lm/emo_pool<k>/<set>/...; empty: just emo_eval_document_expert_pool, unprefixed."
       ),
   )
+  olmo_ppl_eval_modularity_fractions: list[float] = Field(
+      default_factory=list,
+      description=(
+          "olmo_ppl_eval_only: the ladder's modularity eval on the perplexity sets. Each set is split into"
+          " calibration and evaluation documents; calibration sums every MoE layer's full-softmax router"
+          " probabilities per set; then the evaluation documents are scored with every expert ('full'), with"
+          " only the set's top-P experts per layer ('selected_p<P>') and with the top-P of the equal-weight"
+          " mean over sets ('pooled_p<P>'), P = round(fraction x num_experts), for each fraction here. Empty: off."
+      ),
+  )
+  olmo_ppl_eval_modularity_calibration_fraction: float = Field(
+      0.25, description="olmo_ppl_eval modularity: share of each set's documents used for calibration (at least one)."
+  )
+  olmo_ppl_eval_modularity_seed: int = Field(0, description="olmo_ppl_eval modularity: seed of the calibration split.")
   olmo_ppl_eval_only: bool = Field(
       False,
       description=(
