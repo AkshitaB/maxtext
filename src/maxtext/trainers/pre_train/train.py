@@ -1712,6 +1712,7 @@ def run_olmo_ppl_eval_only(config, mesh, state, jit_model_ppl, state_mesh_shardi
       _write_eval_only_results(config, {"start_step": int(start_step), "by_checkpoint": by_ckpt}, name)
     return
   results = {"start_step": int(start_step), "load_parameters_path": config.load_parameters_path}
+  pools = list(config.olmo_ppl_eval_emo_pools) or [None]
   if config.olmo_decode_prompts_path:
     results.update(run_olmo_decode(config, mesh, state, jit_model_ppl, state_mesh_shardings, evaluator, data_sharding))
     pools = []
