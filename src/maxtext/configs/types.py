@@ -1521,6 +1521,13 @@ class MoEGeneral(BaseModel):
           " OLMo-core's in-loop downstream evals (the requests are built with ai2-olmo-eval)."
       ),
   )
+  olmo_score_train_routing: bool = Field(
+      False,
+      description=(
+          "olmo_score_requests_path: route as in training (EMO pool sizes sampled per document) instead of on the EMO"
+          " eval pool, e.g. to measure training-time MoE all-to-all drops with moe_log_a2a_drops."
+      ),
+  )
   olmo_eval_only_checkpoint_paths: list[str] = Field(
       default_factory=list,
       description=(

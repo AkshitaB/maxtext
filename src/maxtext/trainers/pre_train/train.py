@@ -1579,8 +1579,11 @@ def olmo_score_step(model, config, state, data, dropout_rng=None):
   del dropout_rng
   from maxtext.models import olmoe3  # pylint: disable=import-outside-toplevel
 
+  import contextlib  # pylint: disable=import-outside-toplevel
+
   state = nnx.merge(model, state)
-  with olmoe3.emo_eval_pools():
+  routing = contextlib.nullcontext() if config.olmo_score_train_routing else olmoe3.emo_eval_pools()
+  with routing:
     logits = state.model(
         decoder_input_tokens=data["inputs"],
         decoder_positions=data["inputs_position"],
