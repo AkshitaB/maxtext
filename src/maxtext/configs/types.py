@@ -1521,6 +1521,14 @@ class MoEGeneral(BaseModel):
           " OLMo-core's in-loop downstream evals (the requests are built with ai2-olmo-eval)."
       ),
   )
+  olmo_eval_only_checkpoint_paths: list[str] = Field(
+      default_factory=list,
+      description=(
+          "olmo_ppl_eval_only: further params checkpoints (…/<step>/items) to evaluate in the same job after"
+          " load_parameters_path: each is loaded into the state in turn (params only, same shapes, so the compiled"
+          " eval program is reused) and evaluated the same way; results are keyed by checkpoint path."
+      ),
+  )
   olmo_decode_max_new_tokens: int = Field(64, description="olmo_decode: tokens generated per prompt (stops early at EOS).")
   olmo_ppl_eval_only: bool = Field(
       False,

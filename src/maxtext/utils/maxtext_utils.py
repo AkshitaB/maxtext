@@ -1756,6 +1756,45 @@ def setup_training_state(data_iterator, config, mesh, checkpoint_manager, init_s
   )
 
 
+def overlay_params(state, raw_params):
+  """Overlays a params-only restore (load_params_from_path's result) onto a train state in place: restored weights
+  replace the matching leaves, resharded to the state's shardings; everything else is kept."""
+  target_model = (
+      state["model"]
+      if (isinstance(state, (nnx.State, dict)) and "model" in state)
+      else getattr(state, "model", state)
+  )
+  raw_model_params = (
+      raw_params["model"] if (isinstance(raw_params, (nnx.State, dict)) and "model" in raw_params) else raw_params
+  )
+  if hasattr(raw_model_params, "to_pure_dict"):
+    raw_model_params = raw_model_params.to_pure_dict()
+  if isinstance(raw_model_params, dict) and "params" in raw_model_params:
+    raw_model_params = raw_model_params["params"]
+  target_pure = target_model.to_pure_dict() if hasattr(target_model, "to_pure_dict") else target_model
+
+  def _reshard_aligned(target, raw):
+    """Aligns raw arrays with target device shardings using Flax's native flatten_dict utilities."""
+    target_flat = traverse_util.flatten_dict(target)
+    raw_flat = traverse_util.flatten_dict(raw)
+
+    res_flat = {}
+    for k, target_val in target_flat.items():
+      if k in raw_flat and not isinstance(raw_flat[k], jax.ShapeDtypeStruct):
+        raw_val = raw_flat[k]
+        if hasattr(target_val, "sharding") and target_val.sharding is not None:
+          res_flat[k] = jax.device_put(raw_val, target_val.sharding)
+        else:
+          res_flat[k] = raw_val
+      else:
+        res_flat[k] = target_val
+
+    return traverse_util.unflatten_dict(res_flat)
+
+  sharded_aligned = _reshard_aligned(target_pure, raw_model_params)
+  nnx.update(target_model, sharded_aligned)
+
+
 def setup_initial_state(
     data_iterator,
     config,
@@ -1837,40 +1876,7 @@ def setup_initial_state(
       lineage_adapter.restore_params(state["model"], raw_params, config, mesh)
     elif raw_params:
       # Params-only load (base model weights): overlay restored weights, keep init for everything else.
-      target_model = (
-          state["model"]
-          if (isinstance(state, (nnx.State, dict)) and "model" in state)
-          else getattr(state, "model", state)
-      )
-      raw_model_params = (
-          raw_params["model"] if (isinstance(raw_params, (nnx.State, dict)) and "model" in raw_params) else raw_params
-      )
-      if hasattr(raw_model_params, "to_pure_dict"):
-        raw_model_params = raw_model_params.to_pure_dict()
-      if isinstance(raw_model_params, dict) and "params" in raw_model_params:
-        raw_model_params = raw_model_params["params"]
-      target_pure = target_model.to_pure_dict() if hasattr(target_model, "to_pure_dict") else target_model
-
-      def _reshard_aligned(target, raw):
-        """Aligns raw arrays with target device shardings using Flax's native flatten_dict utilities."""
-        target_flat = traverse_util.flatten_dict(target)
-        raw_flat = traverse_util.flatten_dict(raw)
-
-        res_flat = {}
-        for k, target_val in target_flat.items():
-          if k in raw_flat and not isinstance(raw_flat[k], jax.ShapeDtypeStruct):
-            raw_val = raw_flat[k]
-            if hasattr(target_val, "sharding") and target_val.sharding is not None:
-              res_flat[k] = jax.device_put(raw_val, target_val.sharding)
-            else:
-              res_flat[k] = raw_val
-          else:
-            res_flat[k] = target_val
-
-        return traverse_util.unflatten_dict(res_flat)
-
-      sharded_aligned = _reshard_aligned(target_pure, raw_model_params)
-      nnx.update(target_model, sharded_aligned)
+      overlay_params(state, raw_params)
 
     if restored:
       is_emergency = isinstance(

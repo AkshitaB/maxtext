@@ -1632,11 +1632,54 @@ def run_olmo_score(config, mesh, state, jit_model_ppl, state_mesh_shardings, eva
   return {"scores": scores}
 
 
+def _write_eval_only_results(config, results, name):
+  """Writes an eval-only pass's results to <base_output_directory>/<run_name>/<name> (process 0)."""
+  if jax.process_index() == 0:
+    import json  # pylint: disable=import-outside-toplevel
+    from etils import epath  # pylint: disable=import-outside-toplevel
+
+    path = epath.Path(config.base_output_directory) / config.run_name / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(results, indent=1, sort_keys=True))
+    max_logging.log(f"olmo_ppl_eval_only: wrote {path}")
+
+
+def _load_params_checkpoint(config, state, path):
+  """The state with its model weights replaced by a params-only restore of `path` (as load_parameters_path does at
+  setup): the restore target is the state's own params, so shapes and shardings match and nothing recompiles."""
+  abstract = jax.tree.map(
+      lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding) if isinstance(x, jax.Array) else x, state
+  )
+  raw_params = checkpointing.load_params_from_path(
+      path,
+      checkpointing._abstract_params(abstract),  # pylint: disable=protected-access
+      config.checkpoint_storage_concurrent_gb,
+      use_ocdbt=config.checkpoint_storage_use_ocdbt,
+      use_zarr3=config.checkpoint_storage_use_zarr3,
+      enable_single_replica_ckpt_restoring=bool(config.enable_single_replica_ckpt_restoring),
+      convert_flat_moe_weights=bool(getattr(config, "moe_flat_fsdp_weights", False)),
+  )
+  maxtext_utils.overlay_params(state, raw_params)
+  return state
+
+
 def run_olmo_ppl_eval_only(config, mesh, state, jit_model_ppl, state_mesh_shardings, ppl_eval, start_step):
   """olmo_ppl_eval_only: one pass of the perplexity evals on the restored model, once per EMO eval pool in
   olmo_ppl_eval_emo_pools (each its own program), written to <base_output_directory>/<run_name>/olmo_ppl_eval.json."""
   evaluator, data_sharding = ppl_eval
-  pools = list(config.olmo_ppl_eval_emo_pools) or [None]
+  extra = list(config.olmo_eval_only_checkpoint_paths)
+  if extra and not config.olmo_score_requests_path:
+    raise ValueError("olmo_eval_only_checkpoint_paths is supported with olmo_score_requests_path only.")
+  if extra:
+    by_ckpt = {}
+    for i, path in enumerate([config.load_parameters_path] + extra):
+      if i:
+        t0 = time.perf_counter()
+        state = _load_params_checkpoint(config, state, path)
+        max_logging.log(f"olmo_eval_only: loaded {path} ({time.perf_counter() - t0:.0f}s)")
+      by_ckpt[path] = run_olmo_score(config, mesh, state, jit_model_ppl, state_mesh_shardings, evaluator, data_sharding)
+      _write_eval_only_results(config, {"start_step": int(start_step), "by_checkpoint": by_ckpt}, "olmo_score.json")
+    return
   results = {"start_step": int(start_step), "load_parameters_path": config.load_parameters_path}
   if config.olmo_decode_prompts_path:
     results.update(run_olmo_decode(config, mesh, state, jit_model_ppl, state_mesh_shardings, evaluator, data_sharding))
@@ -1663,16 +1706,9 @@ def run_olmo_ppl_eval_only(config, mesh, state, jit_model_ppl, state_mesh_shardi
     max_logging.log(f"olmo_ppl_eval_only pool={pool} ({time.perf_counter() - t0:.0f}s): " + ", ".join(
         f"{k}={v:.4f}" for k, v in out.items() if k.endswith("CE loss")))
     results.update(out)
-  if jax.process_index() == 0:
-    import json  # pylint: disable=import-outside-toplevel
-    from etils import epath  # pylint: disable=import-outside-toplevel
-
-    name = ("olmo_decode.json" if config.olmo_decode_prompts_path
-            else "olmo_score.json" if config.olmo_score_requests_path else "olmo_ppl_eval.json")
-    path = epath.Path(config.base_output_directory) / config.run_name / name
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(results, indent=1, sort_keys=True))
-    max_logging.log(f"olmo_ppl_eval_only: wrote {path}")
+  name = ("olmo_decode.json" if config.olmo_decode_prompts_path
+          else "olmo_score.json" if config.olmo_score_requests_path else "olmo_ppl_eval.json")
+  _write_eval_only_results(config, results, name)
 
 
 def train_loop(config, recorder, state=None, elastic_retry_cache=None):
