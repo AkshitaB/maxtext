@@ -1500,13 +1500,81 @@ def run_olmo_ppl_modularity(config, mesh, state, jit_model_ppl, state_mesh_shard
   return results
 
 
+def olmo_decode_step(model, config, state, data, dropout_rng=None):
+  """Greedy next-token ids at every position (argmax of the logits), routing on the EMO eval pool."""
+  del dropout_rng
+  from maxtext.models import olmoe3  # pylint: disable=import-outside-toplevel
+
+  state = nnx.merge(model, state)
+  with olmoe3.emo_eval_pools():
+    logits = state.model(
+        decoder_input_tokens=data["inputs"],
+        decoder_positions=data["inputs_position"],
+        decoder_segment_ids=data["inputs_segmentation"],
+        enable_dropout=False,
+        decoder_target_tokens=data["targets"],
+        decoder_target_mask=data["targets_segmentation"],
+    )
+  if logits is None:  # the decoder keeps only hidden states under the fused / tiled LM-head loss
+    raise ValueError("olmo_decode needs full logits: set fused_lm_head_ce=False and num_vocab_tiling=1.")
+  return {"argmax": jnp.argmax(logits, axis=-1).astype(jnp.int32)}
+
+
+def run_olmo_decode(config, mesh, state, jit_model_ppl, state_mesh_shardings, evaluator, data_sharding):
+  """olmo_decode_prompts_path: greedy decoding by re-running the full forward pass for each new token (OLMoE3's KDA
+  layers take no decode cache). One prompt per row, starting at position 0 like the perplexity evals; all prompts
+  advance together, a row stops at EOS or olmo_decode_max_new_tokens."""
+  import json  # pylint: disable=import-outside-toplevel
+  from etils import epath  # pylint: disable=import-outside-toplevel
+
+  prompts = json.loads(epath.Path(config.olmo_decode_prompts_path).read_text())
+  seq_len, rows, eos, pad = evaluator.seq_len, evaluator.rows_loaded, evaluator.eos, evaluator.pad
+  usable = evaluator.rows_per_batch
+  max_new = int(config.olmo_decode_max_new_tokens)
+  p_decode = train_utils.jit_eval_step(config, jit_model_ppl, state_mesh_shardings, data_sharding, olmo_decode_step)
+  out = []
+  with jax.set_mesh(mesh), logical_axis_rules(config.logical_axis_rules_for_eval):
+    for start in range(0, len(prompts), usable):
+      chunk = prompts[start : start + usable]
+      seqs = [list(p["tokens"]) for p in chunk]
+      if max(len(t) for t in seqs) + max_new > seq_len:
+        raise ValueError(f"olmo_decode: a prompt plus {max_new} new tokens exceeds max_target_length={seq_len}")
+      done = [False] * len(seqs)
+      t0 = time.perf_counter()
+      for _ in range(max_new):
+        if all(done):
+          break
+        inputs = np.full((rows, seq_len), pad, np.int32)
+        seg = np.zeros((rows, seq_len), np.int32)
+        for i, t in enumerate(seqs):
+          inputs[i, : len(t)] = t
+          seg[i, : len(t)] = 1
+        pos = np.where(seg > 0, np.arange(seq_len, dtype=np.int32)[None, :], 0).astype(np.int32)
+        arrays = {"inputs": inputs, "inputs_position": pos, "inputs_segmentation": seg, "targets": inputs,
+                  "targets_position": pos, "targets_segmentation": seg}
+        batch = {k: jax.make_array_from_callback(v.shape, data_sharding, lambda idx, v=v: v[idx]) for k, v in arrays.items()}
+        nxt = np.asarray(jax.device_get(p_decode(state, batch)["argmax"]))
+        for i, t in enumerate(seqs):
+          if not done[i]:
+            tok = int(nxt[i, len(t) - 1])
+            t.append(tok)
+            done[i] = tok == eos
+      for p, t in zip(chunk, seqs):
+        out.append({"id": p["id"], "prompt_tokens": list(p["tokens"]), "generated_tokens": t[len(p["tokens"]) :]})
+      max_logging.log(f"olmo_decode: {len(chunk)} prompts decoded ({time.perf_counter() - t0:.0f}s)")
+  return {"decode": out, "max_new_tokens": max_new}
+
+
 def run_olmo_ppl_eval_only(config, mesh, state, jit_model_ppl, state_mesh_shardings, ppl_eval, start_step):
   """olmo_ppl_eval_only: one pass of the perplexity evals on the restored model, once per EMO eval pool in
   olmo_ppl_eval_emo_pools (each its own program), written to <base_output_directory>/<run_name>/olmo_ppl_eval.json."""
   evaluator, data_sharding = ppl_eval
   pools = list(config.olmo_ppl_eval_emo_pools) or [None]
   results = {"start_step": int(start_step), "load_parameters_path": config.load_parameters_path}
-  if evaluator.modularity_fractions:
+  if config.olmo_decode_prompts_path:
+    results.update(run_olmo_decode(config, mesh, state, jit_model_ppl, state_mesh_shardings, evaluator, data_sharding))
+    pools = []
+  elif evaluator.modularity_fractions:
     p_step = train_utils.jit_eval_step(
         config, jit_model_ppl, state_mesh_shardings, data_sharding, olmo_ppl_eval.ppl_eval_step(eval_step)
     )
@@ -1529,7 +1597,8 @@ def run_olmo_ppl_eval_only(config, mesh, state, jit_model_ppl, state_mesh_shardi
     import json  # pylint: disable=import-outside-toplevel
     from etils import epath  # pylint: disable=import-outside-toplevel
 
-    path = epath.Path(config.base_output_directory) / config.run_name / "olmo_ppl_eval.json"
+    name = "olmo_decode.json" if config.olmo_decode_prompts_path else "olmo_ppl_eval.json"
+    path = epath.Path(config.base_output_directory) / config.run_name / name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(results, indent=1, sort_keys=True))
     max_logging.log(f"olmo_ppl_eval_only: wrote {path}")

@@ -1502,6 +1502,16 @@ class MoEGeneral(BaseModel):
       0.25, description="olmo_ppl_eval modularity: share of each set's documents used for calibration (at least one)."
   )
   olmo_ppl_eval_modularity_seed: int = Field(0, description="olmo_ppl_eval modularity: seed of the calibration split.")
+  olmo_decode_prompts_path: str = Field(
+      "",
+      description=(
+          "olmo_ppl_eval_only: instead of the perplexity evals, greedy-decode these prompts (a JSON list of"
+          " {\"id\": str, \"tokens\": [int]} token-id prompts, local path or gs://) with the full forward pass per new"
+          " token (no decode cache) on the EMO eval pool, and write the generated token ids to"
+          " <base_output_directory>/<run_name>/olmo_decode.json. Rows are max_target_length long."
+      ),
+  )
+  olmo_decode_max_new_tokens: int = Field(64, description="olmo_decode: tokens generated per prompt (stops early at EOS).")
   olmo_ppl_eval_only: bool = Field(
       False,
       description=(
