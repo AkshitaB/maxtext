@@ -356,6 +356,9 @@ olmo_ppl_eval_modularity_seed: 0
 # Greedy decode (olmo_ppl_eval_only): a JSON list of {id, tokens} prompts; '' = off.
 olmo_decode_prompts_path: ''
 olmo_decode_max_new_tokens: 64
+olmo_decode_temperature: 0.0  # 0 = greedy
+olmo_decode_top_p: 1.0
+olmo_decode_seed: 0
 # Log-prob scoring of request rows (olmo_ppl_eval_only), e.g. OLMo-core's in-loop downstream tasks; '' = off.
 olmo_score_requests_path: ''
 # Further checkpoints (…/<step>/items) to run the same eval-only pass on, one after another in this job.

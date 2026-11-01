@@ -1536,6 +1536,11 @@ class MoEGeneral(BaseModel):
           " eval program is reused) and evaluated the same way; results are keyed by checkpoint path."
       ),
   )
+  olmo_decode_temperature: float = Field(
+      0.0, description="olmo_decode: sampling temperature; 0 = greedy (argmax)."
+  )
+  olmo_decode_top_p: float = Field(1.0, description="olmo_decode: nucleus sampling mass (with temperature > 0).")
+  olmo_decode_seed: int = Field(0, description="olmo_decode: base seed; each prompt row samples with its own fold-in.")
   olmo_decode_max_new_tokens: int = Field(64, description="olmo_decode: tokens generated per prompt (stops early at EOS).")
   olmo_ppl_eval_only: bool = Field(
       False,

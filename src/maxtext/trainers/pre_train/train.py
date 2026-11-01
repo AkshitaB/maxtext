@@ -1522,7 +1522,23 @@ def olmo_decode_step(model, config, state, data, dropout_rng=None):
     )
   if logits is None:  # the decoder keeps only hidden states under the fused / tiled LM-head loss
     raise ValueError("olmo_decode needs full logits: set fused_lm_head_ce=False and num_vocab_tiling=1.")
-  return {"argmax": jnp.argmax(logits, axis=-1).astype(jnp.int32)}
+  # The next token of each row, from the logits at its last real position.
+  last = jnp.maximum(jnp.sum(data["inputs_segmentation"] > 0, axis=-1) - 1, 0)
+  row_logits = jnp.take_along_axis(logits, last[:, None, None], axis=1)[:, 0, :].astype(jnp.float32)  # [B, V]
+  if config.olmo_decode_temperature <= 0:
+    return {"next": jnp.argmax(row_logits, axis=-1).astype(jnp.int32)}
+  scaled = row_logits / config.olmo_decode_temperature
+  if config.olmo_decode_top_p < 1.0:  # nucleus: keep the smallest set of top tokens with mass >= top_p
+    order = jnp.argsort(-scaled, axis=-1)
+    sorted_logits = jnp.take_along_axis(scaled, order, axis=-1)
+    probs = jax.nn.softmax(sorted_logits, axis=-1)
+    keep_sorted = (jnp.cumsum(probs, axis=-1) - probs) < config.olmo_decode_top_p
+    keep = jnp.zeros_like(keep_sorted).at[jnp.arange(scaled.shape[0])[:, None], order].set(keep_sorted)
+    scaled = jnp.where(keep, scaled, -jnp.inf)
+  # Per-row keys: the row's seed (data["decode_seed"][:, 0]) folded into the base seed, so samples don't depend on batching.
+  base = jax.random.PRNGKey(config.olmo_decode_seed)
+  keys = jax.vmap(lambda r: jax.random.fold_in(base, r))(data["decode_seed"][:, 0])
+  return {"next": jax.vmap(jax.random.categorical)(keys, scaled).astype(jnp.int32)}
 
 
 def run_olmo_decode(config, mesh, state, jit_model_ppl, state_mesh_shardings, evaluator, data_sharding):
@@ -1555,20 +1571,25 @@ def run_olmo_decode(config, mesh, state, jit_model_ppl, state_mesh_shardings, ev
           inputs[i, : len(t)] = t
           seg[i, : len(t)] = 1
         pos = np.where(seg > 0, np.arange(seq_len, dtype=np.int32)[None, :], 0).astype(np.int32)
+        # Per-row sampling seed: the prompt's index and the current length, so every draw is distinct.
+        seeds = np.zeros((rows, seq_len), np.int32)
+        for i, t in enumerate(seqs):
+          seeds[i, :] = (start + i) * 4096 + len(t)
         arrays = {"inputs": inputs, "inputs_position": pos, "inputs_segmentation": seg, "targets": inputs,
-                  "targets_position": pos, "targets_segmentation": seg}
+                  "targets_position": pos, "targets_segmentation": seg, "decode_seed": seeds}
         batch = {k: jax.make_array_from_callback(v.shape, data_sharding, lambda idx, v=v: v[idx]) for k, v in arrays.items()}
-        # The ids are sharded over the batch across hosts: gather the whole [rows, seq] array on every host.
-        nxt = np.asarray(multihost_utils.process_allgather(p_decode(state, batch)["argmax"], tiled=True))
+        # The ids are sharded over the batch across hosts: gather them on every host.
+        nxt = np.asarray(multihost_utils.process_allgather(p_decode(state, batch)["next"], tiled=True))
         for i, t in enumerate(seqs):
           if not done[i]:
-            tok = int(nxt[i, len(t) - 1])
+            tok = int(nxt[i])
             t.append(tok)
             done[i] = tok == eos
       for p, t in zip(chunk, seqs):
         out.append({"id": p["id"], "prompt_tokens": list(p["tokens"]), "generated_tokens": t[len(p["tokens"]) :]})
       max_logging.log(f"olmo_decode: {len(chunk)} prompts decoded ({time.perf_counter() - t0:.0f}s)")
-  return {"decode": out, "max_new_tokens": max_new}
+  return {"decode": out, "max_new_tokens": max_new, "temperature": config.olmo_decode_temperature,
+          "top_p": config.olmo_decode_top_p, "seed": config.olmo_decode_seed}
 
 
 _SCORE_PROBES = 4
@@ -1676,8 +1697,8 @@ def run_olmo_ppl_eval_only(config, mesh, state, jit_model_ppl, state_mesh_shardi
   olmo_ppl_eval_emo_pools (each its own program), written to <base_output_directory>/<run_name>/olmo_ppl_eval.json."""
   evaluator, data_sharding = ppl_eval
   extra = list(config.olmo_eval_only_checkpoint_paths)
-  if extra and not config.olmo_score_requests_path:
-    raise ValueError("olmo_eval_only_checkpoint_paths is supported with olmo_score_requests_path only.")
+  if extra and not (config.olmo_score_requests_path or config.olmo_decode_prompts_path):
+    raise ValueError("olmo_eval_only_checkpoint_paths is supported with olmo_score_requests_path or olmo_decode_prompts_path.")
   if extra:
     by_ckpt = {}
     for i, path in enumerate([config.load_parameters_path] + extra):
@@ -1685,8 +1706,10 @@ def run_olmo_ppl_eval_only(config, mesh, state, jit_model_ppl, state_mesh_shardi
         t0 = time.perf_counter()
         state = _load_params_checkpoint(config, state, path)
         max_logging.log(f"olmo_eval_only: loaded {path} ({time.perf_counter() - t0:.0f}s)")
-      by_ckpt[path] = run_olmo_score(config, mesh, state, jit_model_ppl, state_mesh_shardings, evaluator, data_sharding)
-      _write_eval_only_results(config, {"start_step": int(start_step), "by_checkpoint": by_ckpt}, "olmo_score.json")
+      run = run_olmo_decode if config.olmo_decode_prompts_path else run_olmo_score
+      by_ckpt[path] = run(config, mesh, state, jit_model_ppl, state_mesh_shardings, evaluator, data_sharding)
+      name = "olmo_decode.json" if config.olmo_decode_prompts_path else "olmo_score.json"
+      _write_eval_only_results(config, {"start_step": int(start_step), "by_checkpoint": by_ckpt}, name)
     return
   results = {"start_step": int(start_step), "load_parameters_path": config.load_parameters_path}
   if config.olmo_decode_prompts_path:
