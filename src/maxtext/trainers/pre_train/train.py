@@ -1553,7 +1553,8 @@ def run_olmo_decode(config, mesh, state, jit_model_ppl, state_mesh_shardings, ev
         arrays = {"inputs": inputs, "inputs_position": pos, "inputs_segmentation": seg, "targets": inputs,
                   "targets_position": pos, "targets_segmentation": seg}
         batch = {k: jax.make_array_from_callback(v.shape, data_sharding, lambda idx, v=v: v[idx]) for k, v in arrays.items()}
-        nxt = np.asarray(jax.device_get(p_decode(state, batch)["argmax"]))
+        # The ids are sharded over the batch across hosts: gather the whole [rows, seq] array on every host.
+        nxt = np.asarray(multihost_utils.process_allgather(p_decode(state, batch)["argmax"], tiled=True))
         for i, t in enumerate(seqs):
           if not done[i]:
             tok = int(nxt[i, len(t) - 1])
