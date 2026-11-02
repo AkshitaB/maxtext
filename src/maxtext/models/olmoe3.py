@@ -114,9 +114,11 @@ def emo_eval_pools(pool_size=None):
   ``emo_eval_document_expert_pool``."""
   token = _EMO_EVAL_POOLS.set(True)
   size_token = _EMO_EVAL_POOL_SIZE.set(pool_size)
+  eval_token = moe.EVAL_PROGRAM.set(True)
   try:
     yield
   finally:
+    moe.EVAL_PROGRAM.reset(eval_token)
     _EMO_EVAL_POOL_SIZE.reset(size_token)
     _EMO_EVAL_POOLS.reset(token)
 
@@ -1407,6 +1409,13 @@ class OLMoE3LatentRoutedMoE(moe.RoutedMoE):
         forced_routed_experts=forced_routed_experts,
         per_expert_scale=per_expert_scale,
     )
+    if moe.skip_pad_routing(self.config) and input_ids is not None and forced_routed_experts is None:
+      # Padding (segment id 0) routes to no expert: -1 is the forced-routing "unused slot", which the dispatch
+      # counts as nothing (moe.py), so pad tokens take no all-to-all buffer. Chunked dispatch passes these
+      # indices back in as forced experts, keeping the -1s.
+      pad = (input_ids == 0)[..., None]
+      top_k_indices = jnp.where(pad, -1, top_k_indices)
+      top_k_weights = jnp.where(pad, jnp.zeros((), top_k_weights.dtype), top_k_weights)
     return top_k_weights * self.num_experts_per_tok, top_k_indices
 
   def _emo_mask_logits(self, gate_logits, segment_ids, rngs):
@@ -1834,6 +1843,9 @@ class OLMoE3DecoderLayer(nnx.Module):
               jnp.stack([load_balance_loss, _ROUTER_Z_LOSS_WEIGHT * z_loss, metrics[1], metrics[2]]),
           )
         self.sow(nnx.Intermediate, "moe_lb_loss", load_balance_loss + _ROUTER_Z_LOSS_WEIGHT * z_loss)
+      if moe.skip_pad_routing(self.config) and decoder_segment_ids is not None:
+        # Padding sent nothing, so what comes back for it is unspecified (possibly uninitialized); zero it.
+        routed = jnp.where((decoder_segment_ids != 0)[..., None], routed, jnp.zeros((), routed.dtype))
       ffn_out = ffn_out + self.latent_up(routed)
 
     ffn_branch = self.ffn_out_norm(ffn_out)

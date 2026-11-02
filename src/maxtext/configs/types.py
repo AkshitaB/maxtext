@@ -1528,6 +1528,16 @@ class MoEGeneral(BaseModel):
           " eval pool, e.g. to measure training-time MoE all-to-all drops with moe_log_a2a_drops."
       ),
   )
+  olmo_eval_skip_pad_routing: bool = Field(
+      False,
+      description=(
+          "Eval programs only (inside olmoe3.emo_eval_pools: perplexity eval, scoring, decode): padding tokens"
+          " (segment id 0) are routed to no expert, so they take no MoE all-to-all buffer and can't push real"
+          " tokens out of it, and their routed-expert output is zeroed. Eval rows are one document padded to the"
+          " sequence length, and identical pad tokens otherwise all pick the same experts and overflow"
+          " ragged_buffer_factor. Training is unchanged."
+      ),
+  )
   olmo_eval_only_checkpoint_paths: list[str] = Field(
       default_factory=list,
       description=(

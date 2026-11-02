@@ -80,6 +80,15 @@ LB_REDUCE_AXES: contextvars.ContextVar = contextvars.ContextVar("moe_lb_reduce_a
 # steps only (olmoe3_router_metrics_interval): a model computes them under lax.cond on it. None computes them always.
 ROUTER_IMBALANCE_ON: contextvars.ContextVar = contextvars.ContextVar("moe_router_imbalance_on", default=None)
 
+# True while tracing an eval program (OLMoE3's emo_eval_pools sets it): perplexity eval, scoring, decode. With
+# olmo_eval_skip_pad_routing, see skip_pad_routing.
+EVAL_PROGRAM: contextvars.ContextVar = contextvars.ContextVar("moe_eval_program", default=False)
+
+
+def skip_pad_routing(config) -> bool:
+  """olmo_eval_skip_pad_routing inside an eval program: padding tokens route to no expert. Never in training."""
+  return bool(getattr(config, "olmo_eval_skip_pad_routing", False)) and EVAL_PROGRAM.get()
+
 
 set_xla_metadata = xla_metadata.set_xla_metadata
 
@@ -2005,9 +2014,14 @@ class RoutedMoE(nnx.Module):
     topk_argsort_indices = None
     use_tc_sort = False
     tc_routing = None
+    # olmo_eval_skip_pad_routing: eval padding tokens arrive as -1 (OLMoE3.get_topk) and go to the virtual expert
+    # below, which no expert's count includes, so they're never sent and take no all-to-all buffer.
+    skip_pad = skip_pad_routing(self.config)
+    if skip_pad and (row_align > 1 or self.config.moe_use_direct_token_gather):
+      raise ValueError("olmo_eval_skip_pad_routing doesn't support moe_a2a_row_align > 1 or moe_use_direct_token_gather.")
     if use_ragged_in_permute:
       topk_indices_2d = jnp.reshape(selected_experts, (bsz_times_seq_len, selected_experts.shape[2]))
-      if forced_routed_experts is not None:
+      if forced_routed_experts is not None or skip_pad:
         # Padding -> a virtual expert past the last real one: ring_ragged_sort
         # sorts by argsort but counts with one_hot, so -1 would sort before
         # expert 0 while counting as nothing and offset every shard's window.
@@ -2089,13 +2103,18 @@ class RoutedMoE(nnx.Module):
 
       # Must precede roll_to_expert_id: `(-1 - roll) % num_experts` wraps padding
       # onto a real expert id, so a mask computed after it sees no padding at all.
-      if forced_routed_experts is not None:
+      if forced_routed_experts is not None or skip_pad:
         valid_mask = valid_expert_mask(flatten_selected_experts, self.num_experts)
 
       if roll_to_expert_id is not None:
         flatten_selected_experts = (flatten_selected_experts - roll_to_expert_id) % self.num_experts
 
-      if forced_routed_experts is not None:
+      if skip_pad:
+        # The virtual expert num_experts: argsort puts its rows last and _count_ids / bincount(length=num_experts)
+        # leave them out of group_size, so they're never sent. Chunked dispatch's precomputed shard counts
+        # (_count_ids on the -1s) agree.
+        flatten_selected_experts_safe = jnp.where(valid_mask, flatten_selected_experts, self.num_experts)
+      elif forced_routed_experts is not None:
         # Spread padding round-robin: it carries zero weight but still counts in
         # group_size, so under ragged_buffer_factor > 0 it can evict real tokens.
         dummy_indices = jnp.arange(flatten_selected_experts.shape[0]) % self.num_experts
