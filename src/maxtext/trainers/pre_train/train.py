@@ -1616,23 +1616,27 @@ def olmo_score_step(model, config, state, data, dropout_rng=None):
   if logits is None:
     raise ValueError("olmo_score needs full logits: set fused_lm_head_ce=False and num_vocab_tiling=1.")
   lse = jax.nn.logsumexp(logits.astype(jnp.float32), axis=-1)  # [B, S]
-  out = []
+  top = jnp.argmax(logits, axis=-1)  # [B, S]
+  out, greedy = [], []
   for k in range(_SCORE_PROBES):
     t = data[f"probe_target_{k}"]
     picked = jnp.take_along_axis(logits, jnp.maximum(t, 0)[..., None], axis=-1)[..., 0].astype(jnp.float32)
     out.append(jnp.sum(jnp.where(t >= 0, picked - lse, 0.0), axis=-1))
-  return {"logprob": jnp.stack(out, axis=-1)}  # [B, probes]
+    # Every probe token is the model's top choice at its position (vLLM's is_greedy, e.g. greedy_accuracy).
+    greedy.append(jnp.all((t < 0) | (top == t), axis=-1).astype(jnp.int32))
+  return {"logprob": jnp.stack(out, axis=-1), "greedy": jnp.stack(greedy, axis=-1)}  # [B, probes]
 
 
 def run_olmo_score(config, mesh, state, jit_model_ppl, state_mesh_shardings, evaluator, data_sharding):
-  """olmo_score_requests_path: summed log-probs of each row's probes (see the config field)."""
+  """olmo_score_requests_path: summed log-probs of each row's probes (see the config field), and whether every token
+  of a probe is the model's argmax ("greedy")."""
   import json  # pylint: disable=import-outside-toplevel
   from etils import epath  # pylint: disable=import-outside-toplevel
 
   rows_in = json.loads(epath.Path(config.olmo_score_requests_path).read_text())["rows"]
   seq_len, rows, pad, usable = evaluator.seq_len, evaluator.rows_loaded, evaluator.pad, evaluator.rows_per_batch
   p_score = train_utils.jit_eval_step(config, jit_model_ppl, state_mesh_shardings, data_sharding, olmo_score_step)
-  scores, t0 = {}, time.perf_counter()
+  scores, greedy, t0 = {}, {}, time.perf_counter()
   with jax.set_mesh(mesh), logical_axis_rules(config.logical_axis_rules_for_eval):
     for start in range(0, len(rows_in), usable):
       chunk = rows_in[start : start + usable]
@@ -1653,12 +1657,15 @@ def run_olmo_score(config, mesh, state, jit_model_ppl, state_mesh_shardings, eva
                 "targets_position": pos_arr, "targets_segmentation": seg}
       arrays.update({f"probe_target_{k}": probes[k] for k in range(_SCORE_PROBES)})
       batch = {k: jax.make_array_from_callback(v.shape, data_sharding, lambda idx, v=v: v[idx]) for k, v in arrays.items()}
-      lp = np.asarray(multihost_utils.process_allgather(p_score(state, batch)["logprob"], tiled=True))
+      res = p_score(state, batch)
+      lp = np.asarray(multihost_utils.process_allgather(res["logprob"], tiled=True))
+      gr = np.asarray(multihost_utils.process_allgather(res["greedy"], tiled=True))
       for i, r in enumerate(chunk):
         scores[r["id"]] = [float(x) for x in lp[i, : len(r["probes"])]]
+        greedy[r["id"]] = [bool(x) for x in gr[i, : len(r["probes"])]]
       if (start // usable) % 20 == 0:
         max_logging.log(f"olmo_score: {start + len(chunk)}/{len(rows_in)} rows ({time.perf_counter() - t0:.0f}s)")
-  return {"scores": scores}
+  return {"scores": scores, "greedy": greedy}
 
 
 def _write_eval_only_results(config, results, name):
