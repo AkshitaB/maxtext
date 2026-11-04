@@ -118,9 +118,10 @@ class OlmoPplEvalRowsTest(unittest.TestCase):
 class EmoEvalPoolsTest(unittest.TestCase):
   """Under ``emo_eval_pools`` the router keeps the eval pool instead of sampling a pool size per document."""
 
-  def _mask(self, key):
+  def _mask(self, key, causal=False, logits=None, segments=None):
     """(logits, EMo-masked logits) for a router with pools in [2, 8] of 8 experts, sampled with `key`."""
     cfg = types.SimpleNamespace(
+        emo_causal_pool=causal,
         emo_document_expert_pool_choices=[],
         emo_document_expert_pool_probs=[],
         emo_min_document_expert_pool=2,
@@ -130,8 +131,8 @@ class EmoEvalPoolsTest(unittest.TestCase):
         moe_lean_routing=False,
     )
     router = types.SimpleNamespace(config=cfg)
-    logits = jax.random.normal(jax.random.PRNGKey(0), (2, 16, 8))
-    segments = jnp.ones((2, 16), jnp.int32)
+    logits = jax.random.normal(jax.random.PRNGKey(0), (2, 16, 8)) if logits is None else logits
+    segments = jnp.ones((2, 16), jnp.int32) if segments is None else segments
     return logits, olmoe3.OLMoE3LatentRoutedMoE._emo_mask_logits(  # pylint: disable=protected-access
         router, logits, segments, key
     )
@@ -155,6 +156,29 @@ class EmoEvalPoolsTest(unittest.TestCase):
     with olmoe3.emo_eval_pools():  # the override doesn't leak into the next context
       logits, masked = self._mask(jax.random.PRNGKey(1))
     np.testing.assert_array_equal(np.asarray(masked), np.asarray(logits))
+
+  def test_causal_pool_ignores_later_tokens(self):
+    """With ``emo_causal_pool`` a token's pool depends only on its document's tokens up to itself."""
+    segments = jnp.asarray([[1] * 6 + [2] * 10, [1] * 16], jnp.int32)
+    key = jax.random.PRNGKey(1)
+    logits, masked = self._mask(key, causal=True, segments=segments)
+    later = logits.at[:, 9:].add(5.0 * jax.random.normal(jax.random.PRNGKey(2), (2, 7, 8)))
+    _, masked_later = self._mask(key, causal=True, logits=later, segments=segments)
+    keep, keep_later = np.isfinite(np.asarray(masked)), np.isfinite(np.asarray(masked_later))
+    np.testing.assert_array_equal(keep[:, :9], keep_later[:, :9])
+    self.assertFalse(np.array_equal(keep[:, 9:], keep_later[:, 9:]), "later pools should follow the changed tokens")
+
+  def test_causal_pool_first_token_keeps_its_own_top_experts(self):
+    """A document's first token keeps its own highest-scoring experts; its last token's pool is the whole-document one."""
+    segments = jnp.asarray([[1] * 6 + [2] * 10, [1] * 16], jnp.int32)
+    key = jax.random.PRNGKey(1)
+    logits, causal = self._mask(key, causal=True, segments=segments)
+    _, whole = self._mask(key, causal=False, segments=segments)
+    causal, whole, logits = np.asarray(causal), np.asarray(whole), np.asarray(logits)
+    for b, first, last in ((0, 0, 5), (0, 6, 15), (1, 0, 15)):
+      kept = np.isfinite(causal[b, first])
+      self.assertTrue(np.all(logits[b, first][kept].min() >= logits[b, first][~kept]))  # its own top-|pool| logits
+      np.testing.assert_array_equal(np.isfinite(causal[b, last]), np.isfinite(whole[b, last]))
 
 
 class PplEvalGraphdefTest(unittest.TestCase):
