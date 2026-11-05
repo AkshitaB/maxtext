@@ -564,6 +564,31 @@ def step_diagnostics(raw_grads, has_moe_overflow, bias_values, bias_updates):
   }
 
 
+def log_nonfinite_grad_leaves(raw_grads, step):
+  """log_nonfinite_grad_leaves: prints, from process 0, every raw-gradient tensor with a non-finite entry this step.
+
+  One NONFINITE_GRADS line per step that has any, naming each tensor by its tree path with its count of
+  non-finite entries and its size. The counts are reduced on device, so only one int per tensor reaches the host.
+  """
+  flat, _ = jax.tree_util.tree_flatten_with_path(raw_grads)
+  flat = [(p, g) for p, g in flat if hasattr(g, "dtype") and jnp.issubdtype(g.dtype, jnp.inexact)]
+  if not flat:
+    return
+  names = [jax.tree_util.keystr(p) for p, _ in flat]
+  sizes = [int(g.size) for _, g in flat]
+  counts = jnp.stack([jnp.sum(~jnp.isfinite(g)).astype(jnp.int32) for _, g in flat])
+
+  def _print(step_, counts_):
+    if jax.process_index() != 0:
+      return
+    bad = [(n, int(c), s) for n, c, s in zip(names, counts_, sizes) if c]
+    if bad:
+      print(f"NONFINITE_GRADS step={int(step_)} tensors={len(bad)}/{len(names)} "
+            + " ".join(f"{n}={c}/{s}" for n, c, s in bad), flush=True)
+
+  jax.debug.callback(_print, step, counts)
+
+
 def _find_gate_bias(module: nnx.Module | None) -> nnx.Variable | None:
   """Finds the router gate bias parameter in a module graph."""
   if module is None:
@@ -909,6 +934,9 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       scalar_metrics["learning/raw_grad_norm"] = max_utils.l2norm_pytree(raw_grads)
       scalar_metrics["learning/grad_norm"] = max_utils.l2norm_pytree(grads)
       scalar_metrics["learning/param_norm"] = max_utils.l2norm_pytree(nnx.state(new_state.model, nnx.Param))
+
+  if getattr(config, "log_nonfinite_grad_leaves", False):
+    log_nonfinite_grad_leaves(raw_grads, state.optimizer.step.get_value())
 
   # Surface skip-step rejections as a TB metric. The skip-step optimizer stores
   # is_skipped in its opt_state; read it back off the optimizer just updated in place.

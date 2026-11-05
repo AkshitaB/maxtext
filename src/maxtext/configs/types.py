@@ -2007,6 +2007,11 @@ class DeepSeekMoE(BaseModel):
       " max |grad|, the routed-bias checksum (sum over MoE layers of sum(bias)), the number of nonzero routed-bias"
       " update entries and the MoE overflow flag.",
   )
+  log_nonfinite_grad_leaves: bool = Field(
+      False,
+      description="Print, from process 0, each step's raw-gradient tensors that have non-finite entries, with counts"
+      " (NONFINITE_GRADS lines). Debug only: one int per parameter tensor reaches the host each step.",
+  )
   mlp_bias: bool = Field(
       False,
       description="Whether to add a learnable bias for MLP matmul, "
