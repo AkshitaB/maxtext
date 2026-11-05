@@ -577,16 +577,27 @@ def log_nonfinite_grad_leaves(raw_grads, step):
   names = [jax.tree_util.keystr(p) for p, _ in flat]
   sizes = [int(g.size) for _, g in flat]
   counts = jnp.stack([jnp.sum(~jnp.isfinite(g)).astype(jnp.int32) for _, g in flat])
+  # Per-tensor sum of squares (the terms of the global norm) and max |g|, in float32: finite entries large enough to
+  # overflow a square show up here but not in `counts`.
+  sumsq = jnp.stack([jnp.sum(jnp.square(g.astype(jnp.float32))) for _, g in flat])
+  max_abs = jnp.stack([jnp.max(jnp.abs(g.astype(jnp.float32))) for _, g in flat])
 
-  def _print(step_, counts_):
+  def _print(step_, counts_, sumsq_, max_abs_):
     if jax.process_index() != 0:
       return
     bad = [(n, int(c), s) for n, c, s in zip(names, counts_, sizes) if c]
     if bad:
       print(f"NONFINITE_GRADS step={int(step_)} tensors={len(bad)}/{len(names)} "
             + " ".join(f"{n}={c}/{s}" for n, c, s in bad), flush=True)
+    total = float(np.sum(np.asarray(sumsq_, np.float64)))
+    if not np.isfinite(total) or not np.all(np.isfinite(sumsq_)):
+      worst = sorted(range(len(names)), key=lambda i: -float(np.nan_to_num(max_abs_[i], nan=np.inf, posinf=np.inf)))[:8]
+      print(f"GRAD_SUMSQ step={int(step_)} total={total} nonfinite_sumsq="
+            + " ".join(f"{names[i]}" for i in range(len(names)) if not np.isfinite(sumsq_[i]))
+            + " | largest max|g|: " + " ".join(f"{names[i]}={float(max_abs_[i]):.3e}/sumsq={float(sumsq_[i]):.3e}" for i in worst),
+            flush=True)
 
-  jax.debug.callback(_print, step, counts)
+  jax.debug.callback(_print, step, counts, sumsq, max_abs)
 
 
 def _find_gate_bias(module: nnx.Module | None) -> nnx.Variable | None:
